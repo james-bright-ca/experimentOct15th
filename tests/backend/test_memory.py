@@ -1,5 +1,8 @@
-"""MemoryBackend: the shared contract with all, reduced and transfer-only caps,
-plus its symlink resolution, seeding helpers and local side."""
+"""MemoryBackend: the shared contract with its default, reduced and
+transfer-only caps, plus its symlink resolution, seeding helpers and local side.
+
+MemoryBackend does not implement pack, unpack or merge, so no contract variant
+here claims Cap.ARCHIVE: its default caps are every Cap except ARCHIVE."""
 
 from __future__ import annotations
 
@@ -14,6 +17,7 @@ from twinfm.backend.base import (
     ALL_CAPS,
     Backend,
     Cap,
+    DirectoryNotEmpty,
     IsADirectory,
     NotADirectory,
     NotFound,
@@ -25,11 +29,14 @@ from twinfm.backend.memory import MemoryBackend
 
 HOME = "/home/tester"
 
+DEFAULT_CAPS = ALL_CAPS - {Cap.ARCHIVE}
+"""MemoryBackend's default caps: every Cap except ARCHIVE."""
+
 
 class _MemoryContract(BackendContract):
     """Contract plumbing for MemoryBackend; subclasses choose the caps."""
 
-    caps: frozenset[Cap] = ALL_CAPS
+    caps: frozenset[Cap] = DEFAULT_CAPS
 
     @pytest.fixture
     def backend(self) -> MemoryBackend:
@@ -71,11 +78,11 @@ class _MemoryContract(BackendContract):
 
 
 class TestMemoryBackendContract(_MemoryContract):
-    caps = ALL_CAPS
+    caps = DEFAULT_CAPS
 
 
 class TestMemoryBackendWithoutDeleteContract(_MemoryContract):
-    caps = ALL_CAPS - {Cap.DELETE}
+    caps = DEFAULT_CAPS - {Cap.DELETE}
 
 
 class TestTransferOnlyMemoryBackendContract(_MemoryContract):
@@ -120,8 +127,84 @@ def test_caps_label_and_home_are_fixed_at_construction() -> None:
     assert (backend.id, backend.label, backend.home()) == ("memory", "remote", "/srv/data")
     assert backend.snapshot() == {"/srv": None, "/srv/data": None}
     default = MemoryBackend()
-    assert (default.caps, default.label, default.home()) == (ALL_CAPS, "memory", "/")
+    assert (default.caps, default.label, default.home()) == (DEFAULT_CAPS, "memory", "/")
     assert default.snapshot() == {}
+
+
+# -- archives and the listing cache ([C0] criteria) ---------------------------------------------
+
+
+def test_default_caps_are_every_cap_except_archive() -> None:
+    assert MemoryBackend().caps == ALL_CAPS - {Cap.ARCHIVE}
+    assert Cap.ARCHIVE in ALL_CAPS
+    assert Cap("archive") is Cap.ARCHIVE
+    # Caps passed explicitly are still taken as given.
+    assert MemoryBackend(ALL_CAPS).caps == ALL_CAPS
+
+
+def test_archive_attributes_default_to_none() -> None:
+    backend = MemoryBackend()
+    assert (backend.archive_dir, backend.archive_max_bytes) == (None, None)
+
+
+def test_pack_unpack_and_merge_raise_unsupported_naming_archive_and_change_nothing() -> None:
+    backend = MemoryBackend(home="/srv")
+    backend.add_file("/srv/d/f", b"1")
+    backend.add_file("/srv/a.tgz", b"\x1f\x8b not really")
+    backend.add_dir("/srv/t")
+    before = backend.snapshot()
+    calls = [
+        ("/srv/d", lambda: backend.pack("/srv/d", ["f"], "/srv/new.tgz")),
+        ("/srv/d", lambda: backend.pack("/srv/d", ["f"], "/srv/a.tgz")),  # would be AlreadyExists
+        ("/srv/gone", lambda: backend.pack("/srv/gone", ["x"], "/srv/new.tgz")),
+        ("/srv/a.tgz", lambda: backend.unpack("/srv/a.tgz", "/srv/out")),
+        ("/srv/gone.tgz", lambda: backend.unpack("/srv/gone.tgz", "/srv/out")),
+        ("/srv/d", lambda: backend.merge("/srv/d", "/srv/t")),
+        ("/srv/d", lambda: backend.merge("/srv/d", "/srv/d/inside")),  # would be OperationFailed
+        ("/srv/gone", lambda: backend.merge("/srv/gone", "/srv/t")),
+    ]
+    for path, call in calls:
+        with pytest.raises(Unsupported, match="archive") as err:
+            call()
+        assert (err.value.path, err.value.backend_id) == (path, "memory")
+    assert backend.snapshot() == before
+
+
+def test_delete_many_deletes_in_order_and_raises_the_first_failure() -> None:
+    backend = MemoryBackend()
+    for name in ("a", "b", "c"):
+        backend.add_file(f"/{name}", name.encode())
+    backend.add_file("/full/f", b"f")
+    with pytest.raises(NotFound) as err:
+        backend.delete_many(["/a", "/missing", "/b"])
+    assert err.value.path == "/missing"
+    assert backend.snapshot() == {"/b": b"b", "/c": b"c", "/full": None, "/full/f": b"f"}
+    with pytest.raises(DirectoryNotEmpty) as not_empty:
+        backend.delete_many(["/b", "/full", "/c"])
+    assert not_empty.value.path == "/full"
+    assert backend.snapshot() == {"/c": b"c", "/full": None, "/full/f": b"f"}
+    backend.delete_many(["/full/f", "/full", "/c"])
+    assert backend.snapshot() == {}
+
+
+def test_delete_many_without_delete_raises_unsupported_even_for_no_paths() -> None:
+    backend = MemoryBackend(DEFAULT_CAPS - {Cap.DELETE}, home="/h")
+    backend.add_file("/h/f", b"1")
+    before = backend.snapshot()
+    for paths in (["/h/f"], ["/h/missing"], []):
+        with pytest.raises(Unsupported, match="delete"):
+            backend.delete_many(paths)
+    assert backend.snapshot() == before
+
+
+@pytest.mark.parametrize("path", [None, "/", "/d", "/d/e", "/f", "/missing"])
+def test_invalidate_is_a_no_op_without_any_capability(path: str | None) -> None:
+    backend = MemoryBackend(set())
+    backend.add_file("/d/e/f", b"1")
+    backend.add_file("/f", b"2")
+    before = backend.snapshot()
+    assert backend.invalidate(path) is None
+    assert backend.snapshot() == before
 
 
 def test_unsupported_names_the_missing_capability() -> None:

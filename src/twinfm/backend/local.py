@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import errno
+import gzip
 import os
 import posixpath
 import secrets
 import shutil
 import stat
+import tarfile
 import tempfile
-from collections.abc import Callable, Iterator
+import zlib
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from typing import BinaryIO
 
@@ -143,6 +146,31 @@ def _one_name(directory: str, a: str, b: str) -> bool:
         shutil.rmtree(scratch)
 
 
+def _packable(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
+    """pack's filter: leave out entries of kind other, store no owner."""
+    if not (member.isreg() or member.islnk() or member.isdir() or member.issym()):
+        return None
+    member.uid = member.gid = 0
+    member.uname = member.gname = ""
+    return member
+
+
+def _extractable(member: tarfile.TarInfo, dest: str) -> tarfile.TarInfo:
+    """unpack's filter: tarfile's "tar" filter with the owner fields cleared.
+    It also refuses what that filter lets through: an absolute name, which it
+    would strip to a relative one, and a hard link to a file outside ``dest``,
+    through which a later member could be written."""
+    if member.name.startswith("/"):
+        raise tarfile.AbsolutePathError(member)
+    if member.islnk():
+        root = os.path.realpath(dest)
+        target = os.path.realpath(os.path.join(root, member.linkname))
+        if os.path.commonpath([root, target]) != root:
+            raise tarfile.LinkOutsideDestinationError(member, target)
+    member = tarfile.tar_filter(member, dest)
+    return member.replace(uid=None, gid=None, uname=None, gname=None, deep=False)
+
+
 class LocalBackend(Backend):
     """The local filesystem. Stateless and thread-safe; offers every Cap.
 
@@ -151,6 +179,8 @@ class LocalBackend(Backend):
     ``os.replace``, and keep the source's permission bits and times; a copied
     directory tree is built in a temporary sibling directory and moved into
     place. ``rename`` falls back to copy-then-delete across filesystems (EXDEV).
+    ``pack`` and ``unpack`` use ``tarfile``; ``merge`` only renames, so it
+    never crosses filesystems.
     """
 
     id = "local"
@@ -166,6 +196,16 @@ class LocalBackend(Backend):
             raise from_oserror(e, path, self.id) from e
         except ValueError as e:  # e.g. a NUL byte in a path
             raise OperationFailed(path, str(e), self.id, e) from e
+
+    @contextmanager
+    def _archive_errors(self, archive: str) -> Iterator[None]:
+        """Re-raise a damaged or unsafe archive inside the block as
+        OperationFailed about ``archive``."""
+        try:
+            yield
+        # KeyError: tarfile's hard link to a member not stored before it.
+        except (tarfile.TarError, gzip.BadGzipFile, EOFError, zlib.error, KeyError) as e:
+            raise OperationFailed(archive, f"cannot extract ({e})", self.id, e) from e
 
     def _lstat_or_none(self, path: str) -> os.stat_result | None:
         with self._errors(path):
@@ -375,3 +415,89 @@ class LocalBackend(Backend):
                 raise IsADirectory(path, "will not replace a directory", self.id)
         with self._errors(path):
             self._copy_file(local_src, path)
+
+    # -- archives -----------------------------------------------------------------
+
+    def pack(self, parent: str, names: Sequence[str], archive: str) -> None:
+        with self._errors(parent):
+            parent_st = os.stat(parent)
+        if not stat.S_ISDIR(parent_st.st_mode):
+            raise NotADirectory(parent, backend_id=self.id)
+        with self._errors(archive):
+            tar = tarfile.open(archive, "x:gz", compresslevel=6)
+        try:
+            # Closing writes the end of the archive: its failure is about archive.
+            with self._errors(archive), tar:
+                for name in names:
+                    path = self.join(parent, name)
+                    with self._errors(path):
+                        tar.add(path, arcname=name, filter=_packable)
+        except BaseException:
+            with suppress(OSError):
+                os.unlink(archive)
+            raise
+
+    def unpack(self, archive: str, dest: str) -> None:
+        with self._errors(archive), self._archive_errors(archive):
+            tar = tarfile.open(archive, "r:gz")
+        with tar:
+            with self._errors(dest):
+                os.mkdir(dest)
+            try:
+                with self._errors(dest), self._archive_errors(archive):
+                    tar.extractall(dest, filter=_extractable)
+                    # Tar reading stops at the end-of-archive block; gzip checks
+                    # its CRC-32 and size trailer only at the end of the stream.
+                    while tar.fileobj.read(65536):
+                        pass
+                with self._errors(archive):
+                    os.unlink(archive)
+            except BaseException:
+                shutil.rmtree(dest, ignore_errors=True)
+                raise
+
+    def merge(self, src: str, dst: str) -> None:
+        with self._errors(src):
+            sst = os.lstat(src)
+        dst_st = self._lstat_or_none(dst)
+        inside = dst == src or dst.startswith(src.rstrip("/") + "/")
+        if not inside and stat.S_ISDIR(sst.st_mode):
+            # Also when spelt through a symlink or as a case variant.
+            same = dst_st is not None and os.path.samestat(sst, dst_st)
+            inside = same or _inside(dst, sst)
+        if inside:
+            raise OperationFailed(dst, "cannot merge into itself", self.id)
+        self._merge(src, sst, dst, dst_st)
+
+    def _merge(
+        self, src: str, sst: os.stat_result, dst: str, dst_st: os.stat_result | None
+    ) -> None:
+        """merge, given the lstat results of ``src`` and ``dst`` (None: nothing there)."""
+        if dst_st is not None and stat.S_ISDIR(dst_st.st_mode):
+            if not stat.S_ISDIR(sst.st_mode):
+                raise IsADirectory(dst, "will not replace a directory", self.id)
+            with self._errors(src):
+                names = os.listdir(src)
+            for name in names:
+                entry, target = self.join(src, name), self.join(dst, name)
+                with self._errors(entry):
+                    entry_st = os.lstat(entry)
+                self._merge(entry, entry_st, target, self._lstat_or_none(target))
+            with self._errors(src):
+                os.rmdir(src)
+            return
+        if dst_st is not None:
+            if stat.S_ISDIR(sst.st_mode):
+                raise NotADirectory(dst, "will not replace a file with a directory", self.id)
+            with self._errors(src):
+                if os.path.samestat(sst, dst_st) and not _same_entry(src, sst, dst, dst_st):
+                    # rename(2) does nothing when both names link one file:
+                    # replacing dst with src is removing the name src.
+                    os.unlink(src)
+                    return
+        try:
+            os.rename(src, dst)
+        except OSError as e:
+            raise from_oserror(e, dst if e.errno == errno.ENOENT else src, self.id) from e
+        except ValueError as e:
+            raise OperationFailed(src, str(e), self.id, e) from e

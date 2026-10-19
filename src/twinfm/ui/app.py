@@ -1,22 +1,38 @@
 """TwinFM: the two-panel app, its keys and the file operations.
 
-Keys, in Midnight Commander tradition: F5 copy, F6 move, Shift-F6 (or
-Ctrl-N) rename in place, F7 make directory, F8 delete, F9 connect the panel
-to another backend or path, F10 quit; Enter opens a directory, Backspace goes
-to the parent, Tab switches panel, Space / Insert / Ctrl-T select, Ctrl-R
-reloads. Terminals that send F-keys as media keys can use Esc then the digit
-(Esc 5 is F5 ... Esc 0 is F10), or Alt/Option with the digit.
+Keys, in Midnight Commander tradition: F5 copy, F6 move, Ctrl-N rename in
+place, F7 make directory, F8 delete, F9 connect the panel to another backend
+or path, F10 quit; Enter opens a directory, Backspace goes to the parent, Tab
+switches panel, Space / Insert / Ctrl-T select, Ctrl-R reloads. Shift-F6
+renames too where the terminal sends it as ESC[17;2~ (xterm, iTerm2); macOS
+Terminal.app's Shift-F6 cannot be read, so the footer shows Ctrl-N.
+Terminals that send F-keys as media keys can use Esc then the digit (Esc 5
+is F5 ... Esc 0 is F10), typed slowly or fast, or Option with the digit on a
+US layout (the character it types, such as ∞ for Option-5, is read as that
+digit).
+
+F4 (or Esc then 4, or Option-4) edits the file on the cursor row of a local
+panel in $VISUAL, else $EDITOR, else vim, with the app suspended until the
+editor exits. Ctrl-R reloads past any cached listing: a backend may cache
+listings (btty does) and keeps them current only for twinfm's own changes.
+F5 and F6 of a folder or several items between a local panel and another
+store that packs archives (Cap.ARCHIVE) offer an Archive checkbox, checked:
+the batch then travels as one archive (see ``Engine.copy``).
 
 Threading: the UI thread never calls a backend or the engine. Listings,
 connects and operations run in Textual thread workers. When the engine needs
 an answer, its callback pushes a dialog through ``call_from_thread`` and
-waits for it on the worker thread.
+waits for it on the worker thread. The editor (F4) blocks the UI thread
+while it runs; workers carry on, and their questions wait until it exits.
 """
 
 from __future__ import annotations
 
 import importlib
+import os
 import posixpath
+import shlex
+import subprocess
 import threading
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
@@ -24,7 +40,7 @@ from functools import partial
 from typing import Any, cast
 
 from textual import events
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SuspendNotSupported
 from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.screen import Screen
@@ -32,6 +48,7 @@ from textual.widgets import Footer
 
 from twinfm import backend as registry
 from twinfm.backend.base import Backend, Cap, Entry, FsError
+from twinfm.backend.local import LocalBackend
 from twinfm.config import Settings
 from twinfm.ops.model import Callbacks, Conflict, Engine, OnError, Progress, Report
 from twinfm.ui.dialogs import (
@@ -42,6 +59,7 @@ from twinfm.ui.dialogs import (
     InputDialog,
     ProgressDialog,
     SummaryDialog,
+    TransferDialog,
 )
 from twinfm.ui.panel import Panel
 
@@ -49,14 +67,51 @@ __all__ = ["FileManagerScreen", "TwinFM"]
 
 Location = tuple[Backend, str]
 OpenBackend = Callable[[str, Settings], Backend]
+RunEditor = Callable[[list[str]], int]
 
 # Esc then a digit stands for the F-key of that number (0 is F10).
-_ESC_DIGITS = {"5": "copy", "6": "move", "7": "mkdir", "8": "delete", "9": "connect", "0": "quit"}
+_ESC_DIGITS = {
+    "4": "edit",
+    "5": "copy",
+    "6": "move",
+    "7": "mkdir",
+    "8": "delete",
+    "9": "connect",
+    "0": "quit",
+}
+
+# Textual 8.2.8 reads a fast Esc+digit as the character macOS Option+digit
+# types on a US layout; each stands for its digit.
+_OPTION_DIGITS = {"¢": "4", "∞": "5", "§": "6", "¶": "7", "•": "8", "ª": "9", "º": "0"}
 
 
 def _normalised(path: str) -> str:
     # normpath keeps a POSIX leading "//"; backend paths start with exactly one "/".
     return "/" + posixpath.normpath(path).lstrip("/")
+
+
+def _editor_argv(path: str) -> list[str]:
+    """$VISUAL, else $EDITOR, else vim, split as a shell would, then ``path``;
+    vim when the chosen value is empty or does not parse."""
+    value = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vim"
+    try:
+        command = shlex.split(value)
+    except ValueError:  # an unclosed quote
+        command = []
+    return [*(command or ["vim"]), path]
+
+
+def _archive_applies(src: Backend, dst: Backend, items: Sequence[Entry]) -> bool:
+    """Whether the engine could move ``items`` from ``src`` to ``dst`` as one
+    archive (see ``Engine.copy``), so the Archive checkbox is worth showing:
+    both stores have Cap.ARCHIVE, exactly one is local, and there is a
+    directory or several items."""
+    return (
+        Cap.ARCHIVE in src.caps
+        and Cap.ARCHIVE in dst.caps
+        and isinstance(src, LocalBackend) != isinstance(dst, LocalBackend)
+        and (len(items) > 1 or items[0].kind == "dir")
+    )
 
 
 class FileManagerScreen(Screen[None]):
@@ -66,15 +121,20 @@ class FileManagerScreen(Screen[None]):
     FileManagerScreen > Horizontal {
         height: 1fr;
     }
+    FileManagerScreen Footer FooterKey:last-of-type {
+        margin-right: 0;
+    }
     """
 
     BINDINGS = [
+        Binding("f4", "app.edit", "Edit", key_display="F4"),
         Binding("f5", "app.copy", "Copy", key_display="F5"),
         Binding("f6", "app.move", "Move", key_display="F6"),
-        Binding("shift+f6,f18", "app.rename", "Rename", key_display="S-F6"),
-        Binding("ctrl+n", "app.rename", "Rename", show=False),
+        # The footer shows one key per action: Ctrl-N, which every terminal sends.
+        Binding("shift+f6", "app.rename", "Rename", show=False),
+        Binding("ctrl+n", "app.rename", "Rename", key_display="^N"),
         Binding("f7", "app.mkdir", "Mkdir", key_display="F7"),
-        Binding("f8", "app.delete", "Delete", key_display="F8"),
+        Binding("f8", "app.delete", "Del", key_display="F8"),
         Binding("f9", "app.connect", "Connect", key_display="F9"),
         Binding("f10", "app.quit", "Quit", key_display="F10"),
         *(Binding(f"alt+{digit}", f"app.{action}", show=False) for digit, action in _ESC_DIGITS.items()),
@@ -91,7 +151,9 @@ class FileManagerScreen(Screen[None]):
         with Horizontal():
             yield self.left_panel
             yield self.right_panel
-        yield Footer()
+        # Compact, without the palette key (Ctrl-P still opens it), so that
+        # every key fits Terminal.app's default 80 columns.
+        yield Footer(compact=True, show_command_palette=False)
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
         for node in event.widget.ancestors_with_self:
@@ -108,10 +170,13 @@ class FileManagerScreen(Screen[None]):
             return
         if self._esc_pending:
             self._esc_pending = False
-            action = _ESC_DIGITS.get(event.key)
-            if action is not None:
-                event.stop()
-                await self.app.run_action(action)
+            digit = event.key
+        else:
+            digit = _OPTION_DIGITS.get(event.character or "", "")
+        action = _ESC_DIGITS.get(digit)
+        if action is not None:
+            event.stop()
+            await self.app.run_action(action)
 
 
 class TwinFM(App[None]):
@@ -119,6 +184,9 @@ class TwinFM(App[None]):
 
     ``engine`` defaults to the module ``twinfm.ops.engine``, imported on first
     use; ``open_backend`` (used by Connect) defaults to the backend registry.
+    ``run_editor(argv)`` (used by F4) runs the editor command ``argv`` and
+    returns its exit status; the default suspends the app and runs it in the
+    terminal.
     """
 
     TITLE = "twinfm"
@@ -130,12 +198,14 @@ class TwinFM(App[None]):
         settings: Settings,
         engine: Engine | None = None,
         open_backend: OpenBackend | None = None,
+        run_editor: RunEditor | None = None,
     ) -> None:
         super().__init__()
         self.settings = settings
         self._locations = (left, right)
         self._engine = engine
         self._open_backend = open_backend or registry.open_backend
+        self._run_editor = run_editor or self._edit_suspended
         self._stopping = threading.Event()
         self._main: FileManagerScreen | None = None
 
@@ -197,6 +267,48 @@ class TwinFM(App[None]):
     def _not_available(self, what: str) -> None:
         self.notify(f"{what} is not available in transfer-only mode", severity="warning")
 
+    def action_edit(self) -> None:
+        """F4: edit the file on the cursor row of a local panel, then list the
+        panel again with the cursor on it."""
+        panel = self.active_panel
+        if not isinstance(panel.backend, LocalBackend):
+            self.notify(
+                "F4 edits local files only; copy the file to a local panel to edit it",
+                severity="warning",
+            )
+            return
+        entry = panel.cursor_entry
+        if entry is None:
+            return
+        if entry.kind != "file" and not (entry.kind == "symlink" and entry.target_kind == "file"):
+            self.notify(f'"{entry.name}" is not a file', title="Edit", severity="warning", markup=False)
+            return
+        try:
+            status = self._run_editor(_editor_argv(entry.path))
+        except SuspendNotSupported:
+            self.notify("This terminal cannot be handed over to an editor", title="Edit")
+        except OSError as e:
+            self.notify(str(e), title="Cannot start the editor", severity="error", markup=False)
+        else:
+            if status != 0:
+                self.notify(f"The editor exited with status {status}", title="Edit", severity="warning")
+        self._refresh([panel.backend], panel, entry.name)
+
+    def _edit_suspended(self, argv: list[str]) -> int:
+        """The default ``run_editor``: give the terminal to ``argv`` until it exits."""
+        failure: OSError | None = None
+        status = 0
+        with self.suspend():
+            try:
+                status = subprocess.run(argv, check=False).returncode
+            except OSError as e:
+                # An exception leaving the block would skip Textual's resume of
+                # the terminal, so it is raised only once the app has it back.
+                failure = e
+        if failure is not None:
+            raise failure
+        return status
+
     def action_copy(self) -> None:
         self._transfer("copy")
 
@@ -221,16 +333,24 @@ class TwinFM(App[None]):
         # Relative to the source directory on one store (as MC does), else to the destination's.
         base = src.path if dst_backend is src_backend else dst.path
 
-        def chosen(text: str | None) -> None:
+        def chosen(text: str | None, archive: bool = False) -> None:
             if not text or not text.strip():
                 return
             target = _normalised(text if text.startswith("/") else dst_backend.join(base, text))
             self._confirm_replace(
                 dst_backend,
-                partial(self._run_transfer, op, src_backend, paths, dst_backend, target, src),
+                partial(self._run_transfer, op, src_backend, paths, dst_backend, target, src, archive),
             )
 
-        self.push_screen(InputDialog(verb, f"{verb} {what} to:", dst.path), chosen)
+        def answered(result: tuple[str, bool] | None) -> None:
+            if result is not None:
+                chosen(*result)
+
+        prompt = f"{verb} {what} to:"
+        if _archive_applies(src_backend, dst_backend, items):
+            self.push_screen(TransferDialog(verb, prompt, dst.path), answered)
+        else:
+            self.push_screen(InputDialog(verb, prompt, dst.path), chosen)
 
     def _download(self, src: Panel, dst: Panel) -> None:
         """F5 in a transfer-only panel: fetch one file by its typed path."""
@@ -275,10 +395,11 @@ class TwinFM(App[None]):
         dst: Backend,
         target: str,
         source: Panel | None,
+        archive: bool = False,
     ) -> None:
         def call(cb: Callbacks) -> Report:
             method = self.engine.copy if op == "copy" else self.engine.move
-            return method(src, paths, dst, target, cb)
+            return method(src, paths, dst, target, cb, archive=archive)
 
         changed = [dst] if op == "copy" else [dst, src]
         self._run_operation(op.capitalize(), call, changed, source)

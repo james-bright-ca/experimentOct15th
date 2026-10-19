@@ -16,12 +16,14 @@ import re
 import shlex
 import stat
 import subprocess
+import tarfile
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from tests.backend.fake_btty import run_script, script_env, script_paths
+from tests.backend.contract import DIR, FILE, LINK, Node, make_archive
+from tests.backend.fake_btty import run_script, script_env, script_names, script_paths
 from twinfm.backend.base import (
     AlreadyExists,
     DirectoryNotEmpty,
@@ -31,6 +33,7 @@ from twinfm.backend.base import (
     NotFound,
     OperationFailed,
     PermissionDenied,
+    Unsupported,
 )
 from twinfm.backend.btty_scripts import (
     COMMAND_BUDGET,
@@ -39,11 +42,15 @@ from twinfm.backend.btty_scripts import (
     delete_scripts,
     error_for,
     list_script,
+    merge_script,
     mkdir_script,
+    pack_list_script,
+    pack_script,
     parse_output,
     rename_script,
     stat_script,
     to_entry,
+    unpack_script,
     walk_script,
 )
 
@@ -354,6 +361,7 @@ def test_record_look_alikes_are_noise(line: str) -> None:
         ("EINVAL", OperationFailed),
         ("EIO", OperationFailed),
         ("ELOOP", OperationFailed),
+        ("EXDEV", OperationFailed),  # merge across filesystems (base.py: OperationFailed)
     ],
 )
 def test_each_error_code_maps_to_its_fs_error_about_the_reported_path(
@@ -537,6 +545,7 @@ alias cp='echo ALIASED cp'
 alias mkdir='echo ALIASED mkdir'
 alias rmdir='echo ALIASED rmdir'
 alias ls='echo ALIASED ls'
+alias python3='echo ALIASED python3'
 cd() { echo HIJACKED cd; }
 """
 
@@ -557,8 +566,9 @@ def run_in_hostile_bash(script: str) -> tuple[int, str]:
 
 
 def test_the_hostile_shell_really_aliases_the_tools() -> None:
-    _, output = run_in_hostile_bash("rm -rf /nonexistent-t19; cd /")
+    _, output = run_in_hostile_bash("rm -rf /nonexistent-t19; cd /; python3 -V")
     assert "ALIASED rm" in output and "HIJACKED cd" in output
+    assert "ALIASED python3" in output
 
 
 def test_mutation_scripts_ignore_aliases_and_shell_functions(tmp_path: Path) -> None:
@@ -614,3 +624,394 @@ def test_a_failed_copy_leaves_no_temporary_sibling(tmp_path: Path) -> None:
         assert sorted(os.listdir(root)) == ["src"]
     finally:
         os.chmod(root / "src" / "secret", 0o644)
+
+
+# -- the archive scripts: builders -----------------------------------------------------------
+
+ArchiveBuilder = Callable[[str], "str | None"]
+ARCHIVE_BUILDERS: dict[str, ArchiveBuilder] = {
+    "pack": lambda p: pack_script(p, ["one", "two words"], p + ".tgz"),
+    "pack-from-file": lambda p: pack_list_script(p, p + ".tgz.names", p + ".tgz"),
+    "unpack": lambda p: unpack_script(p + ".tgz", p + "-out"),
+    "merge": lambda p: merge_script(p, p + "-merged"),
+}
+
+
+def words_of(script: str | None) -> list[str]:
+    """The words of a python3 script's command line, after the alias line."""
+    assert script is not None
+    head, body = script.split("\n", 1)
+    assert head == HEAD
+    return shlex.split(body)
+
+
+@pytest.mark.parametrize("builder", ARCHIVE_BUILDERS.values(), ids=ARCHIVE_BUILDERS.keys())
+def test_every_archive_script_drops_aliases_first_and_never_calls_exit(builder: ArchiveBuilder) -> None:
+    script = builder(f"{WORKSPACE}/project/folder")
+    assert script is not None
+    assert script.split("\n", 1)[0] == HEAD
+    assert re.search(r"\bexit\b", script) is None
+
+
+_FOLDER = f"{WORKSPACE}/project/{'n' * 100}"
+_STAGING = f"{_FOLDER}/.twinfm-0123456789abcdef"
+_IN_TMP = "/tmp/.twinfm-0123456789abcdef.tgz"
+REALISTIC_ARCHIVE_SCRIPTS: dict[str, Callable[[], str | None]] = {
+    # Downloading: the selection's folder is packed into remote_tmp.
+    "pack": lambda: pack_script(_FOLDER, ["src", "README.md", "build output"], _IN_TMP),
+    "pack-from-file": lambda: pack_list_script(_FOLDER, _IN_TMP + ".names", _IN_TMP),
+    # Uploading: the archive and the staging directory sit in the target folder.
+    "unpack": lambda: unpack_script(_STAGING + ".tgz", _STAGING),
+    "merge": lambda: merge_script(_STAGING + "/src", f"{_FOLDER}/src"),
+}
+
+
+@pytest.mark.parametrize(
+    "build", REALISTIC_ARCHIVE_SCRIPTS.values(), ids=REALISTIC_ARCHIVE_SCRIPTS.keys()
+)
+def test_every_archive_script_fits_the_budget_for_the_paths_archive_mode_uses(
+    build: Callable[[], str | None],
+) -> None:
+    # A 100-character folder name in the user's workspace, and the staging
+    # and archive names of archive mode.
+    script = build()
+    assert script is not None
+    assert len(script.encode("utf-8")) <= COMMAND_BUDGET
+
+
+@pytest.mark.parametrize("builder", ARCHIVE_BUILDERS.values(), ids=ARCHIVE_BUILDERS.keys())
+def test_every_archive_script_leaves_room_for_about_500_bytes_of_paths(builder: ArchiveBuilder) -> None:
+    # The module docstring: "the archive programs leave about 500 bytes for
+    # their quoted paths". Each builder here names up to three paths derived
+    # from one, so 140 bytes each stays within that.
+    script = builder("/" + "p" * 139)
+    assert script is not None
+    assert len(script.encode("utf-8")) <= COMMAND_BUDGET
+
+
+@pytest.mark.parametrize("builder", ARCHIVE_BUILDERS.values(), ids=ARCHIVE_BUILDERS.keys())
+@pytest.mark.parametrize("path", ["relative/path", "", "/a\0b"], ids=["relative", "empty", "nul"])
+def test_an_archive_script_refuses_a_relative_or_nul_path(builder: ArchiveBuilder, path: str) -> None:
+    with pytest.raises(OperationFailed):
+        builder(path)
+
+
+@pytest.mark.parametrize(
+    "builder",
+    [ARCHIVE_BUILDERS["pack-from-file"], ARCHIVE_BUILDERS["unpack"], ARCHIVE_BUILDERS["merge"]],
+    ids=["pack-from-file", "unpack", "merge"],
+)
+def test_an_archive_script_too_long_for_one_command_raises_unsupported(builder: ArchiveBuilder) -> None:
+    # Unsupported, not OperationFailed: the caller then transfers per file.
+    long = "/" + "/".join(["d" * 100] * 12)
+    with pytest.raises(Unsupported) as err:
+        builder(long)
+    assert "too long" in err.value.message
+
+
+def test_an_unpack_script_may_use_exactly_the_budget_and_not_one_byte_more() -> None:
+    spare = COMMAND_BUDGET - len(unpack_script("/a", "/b").encode())
+    fits = "/b" + "b" * spare
+    assert len(unpack_script("/a", fits).encode()) == COMMAND_BUDGET
+    with pytest.raises(Unsupported):
+        unpack_script("/a", fits + "b")
+
+
+def test_pack_names_go_inline_up_to_the_budget_and_otherwise_pack_script_returns_none() -> None:
+    parent, archive = f"{WORKSPACE}/src", f"{WORKSPACE}/a.tgz"
+    base = pack_script(parent, ["a"], archive)
+    assert base is not None
+    name = "a" * (1 + COMMAND_BUDGET - len(base.encode()))
+    exact = pack_script(parent, [name], archive)
+    assert exact is not None and len(exact.encode()) == COMMAND_BUDGET
+    assert pack_script(parent, [name + "a"], archive) is None
+    many = [f"report {i:03d} - it's *final*.txt" for i in range(200)]
+    assert pack_script(parent, many, archive) is None
+    listed = pack_list_script(parent, archive + ".names", archive)
+    assert len(listed.encode()) <= COMMAND_BUDGET
+
+
+@pytest.mark.parametrize("path", HOSTILE_PATHS, ids=repr)
+def test_archive_scripts_pass_one_fixed_program_and_each_path_and_name_as_its_own_word(path: str) -> None:
+    other = f"{WORKSPACE}/other 'one'"
+    names = ["it's", "new\nline", "-dash", "$(x) *", " padded "]
+    pack = pack_script(path, names, other)
+    words = {
+        "p": words_of(pack),
+        "f": words_of(pack_list_script(path, other + ".names", other)),
+        "u": words_of(unpack_script(other, path)),
+        "m": words_of(merge_script(path, other)),
+    }
+    assert words["p"][4:] == ["p", other, path, *names]
+    assert words["f"][4:] == ["f", other, path, other + ".names"]
+    assert words["u"][4:] == ["u", other, path]
+    assert words["m"][4:] == ["m", path, other]
+    for op, these in words.items():
+        assert these[:3] == ["python3", "-I", "-c"], op
+        assert path not in these[3] and other not in these[3], op
+    assert words["p"][3] == words["f"][3], "pack has one program, whatever the op"
+    listing = words_of(list_script("/x"))[3]
+    assert len({words["p"][3], words["u"][3], words["m"][3], listing}) == 4
+    assert pack is not None
+    assert script_paths(pack) == [other, path] and script_names(pack) == names
+
+
+def test_nofilter_maps_to_unsupported_about_the_operation_s_path() -> None:
+    # What the programs print without tarfile.tar_filter: the code and an empty path.
+    output = parse_output("@X NOFILTER \n")
+    assert output.errors == [("NOFILTER", None)]
+    err = error_for(output, "/base/a.tgz", "btty", 0)
+    assert type(err) is Unsupported
+    assert err.path == "/base/a.tgz" and err.backend_id == "btty"
+
+
+# -- the archive programs, run for real with /bin/sh --------------------------------------------
+
+
+def outcome(script: str | None, *, tar_filter: bool = True) -> tuple[list[tuple[str, str | None]], bool]:
+    """(the @X records, whether @K was printed) of running ``script``; it must exit 0."""
+    assert script is not None
+    status, output = run_script(script, tar_filter=tar_filter)
+    assert status == 0, output
+    parsed = parse_output(output)
+    return parsed.errors, parsed.done
+
+
+def files_below(root: Path) -> dict[str, Node]:
+    """Every path below ``root`` (lstat) as contract nodes."""
+    result: dict[str, Node] = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in dirnames + filenames:
+            path = Path(dirpath, name)
+            rel = str(path.relative_to(root))
+            if path.is_symlink():
+                result[rel] = LINK(os.readlink(path))
+            elif path.is_dir():
+                result[rel] = DIR
+            else:
+                result[rel] = FILE(path.read_bytes()) if path.is_file() else ("other", None)
+    return result
+
+
+def tar_members(path: Path) -> dict[str, tuple[Node, int, int, int, str, str, int]]:
+    """name -> (node, mode, uid, gid, uname, gname, mtime) for each member."""
+    result = {}
+    with tarfile.open(path, "r:gz") as tar:
+        for info in tar.getmembers():
+            if info.isdir():
+                node = DIR
+            elif info.issym():
+                node = LINK(info.linkname)
+            else:
+                extracted = tar.extractfile(info)
+                assert extracted is not None, info.name
+                node = FILE(extracted.read())
+            result[info.name] = (node, info.mode, info.uid, info.gid, info.uname, info.gname, int(info.mtime))
+    return result
+
+
+@pytest.fixture
+def area(tmp_path: Path) -> Path:
+    """A resolved scratch directory (error paths are compared literally)."""
+    root = tmp_path.resolve() / "area"
+    root.mkdir()
+    return root
+
+
+def test_the_pack_program_stores_the_selection_relative_to_the_parent_without_owners_or_special_files(
+    area: Path,
+) -> None:
+    src = area / "src"
+    (src / "d").mkdir(parents=True)
+    (src / "f").write_bytes(b"one")
+    os.chmod(src / "f", 0o640)
+    os.utime(src / "f", (1_500_000_000, 1_500_000_000))
+    (src / "d" / "g").write_bytes(b"two")
+    os.mkfifo(src / "d" / "fifo")
+    os.mkfifo(src / "fifo")
+    os.symlink("f", src / "link")
+    (src / "unselected").write_bytes(b"no")
+    archive = area / "a.tgz"
+    assert outcome(pack_script(str(src), ["f", "d", "link", "fifo"], str(archive))) == ([], True)
+    packed = tar_members(archive)
+    assert {name: value[0] for name, value in packed.items()} == {
+        "f": FILE(b"one"), "d": DIR, "d/g": FILE(b"two"), "link": LINK("f"),
+    }
+    assert all(value[2:6] == (0, 0, "", "") for value in packed.values())
+    assert packed["f"][1] == 0o640 and packed["f"][6] == 1_500_000_000
+    assert (archive.read_bytes()[:2]) == b"\x1f\x8b"
+
+
+@pytest.mark.parametrize(
+    "failure", ["existing-archive", "missing-parent", "parent-is-a-file", "missing-name", "missing-archive-dir"]
+)
+def test_the_pack_program_reports_each_failure_about_the_path_at_fault_and_leaves_no_archive(
+    area: Path, failure: str
+) -> None:
+    src = area / "src"
+    src.mkdir()
+    (src / "f").write_bytes(b"1")
+    parent, names, archive = src, ["f"], area / "a.tgz"
+    if failure == "existing-archive":
+        archive.write_bytes(b"precious")
+        expected = ("EEXIST", archive)
+    elif failure == "missing-parent":
+        parent = area / "missing"
+        expected = ("ENOENT", parent)
+    elif failure == "parent-is-a-file":
+        parent = src / "f"
+        expected = ("ENOTDIR", parent)
+    elif failure == "missing-name":
+        names = ["f", "missing"]
+        expected = ("ENOENT", src / "missing")
+    else:
+        archive = area / "missing" / "a.tgz"
+        expected = ("ENOENT", archive)
+    before = files_below(area)
+    assert outcome(pack_script(str(parent), names, str(archive))) == ([(expected[0], str(expected[1]))], False)
+    assert files_below(area) == before
+
+
+@pytest.mark.parametrize("case", ["packs", "missing-parent", "no-tar-filter"])
+def test_the_pack_program_reads_the_names_file_and_removes_it_before_anything_else(
+    area: Path, case: str
+) -> None:
+    src = area / "src"
+    src.mkdir()
+    names = [f"report {i:03d} - it's *final*.txt" for i in range(150)] + ["new\nline", "ü"]
+    for name in names:
+        (src / name).write_bytes(name.encode())
+    names_file, archive = area / "a.tgz.names", area / "a.tgz"
+    names_file.write_bytes(b"\0".join(n.encode() for n in names))
+    parent = area / "missing" if case == "missing-parent" else src
+    errors, done = outcome(
+        pack_list_script(str(parent), str(names_file), str(archive)), tar_filter=case != "no-tar-filter"
+    )
+    assert not names_file.exists()
+    if case == "packs":
+        assert (errors, done) == ([], True)
+        assert {name: value[0] for name, value in tar_members(archive).items()} == {
+            name: FILE(name.encode()) for name in names
+        }
+    else:
+        code = "ENOENT" if case == "missing-parent" else "NOFILTER"
+        assert [c for c, _ in errors] == [code] and not done
+        assert not archive.exists()
+
+
+def test_without_tar_filter_the_pack_program_writes_nothing(area: Path) -> None:
+    (area / "src").mkdir()
+    (area / "src" / "f").write_bytes(b"1")
+    before = files_below(area)
+    script = pack_script(str(area / "src"), ["f"], str(area / "a.tgz"))
+    assert outcome(script, tar_filter=False) == ([("NOFILTER", None)], False)
+    assert files_below(area) == before
+
+
+def test_the_unpack_program_extracts_into_a_new_directory_and_removes_the_archive(area: Path) -> None:
+    archive = area / "a.tgz"
+    archive.write_bytes(make_archive([("d", DIR), ("d/f", FILE(b"1")), ("d/rel", LINK("f")), ("g", FILE(b"2"))]))
+    (area / "parent").mkdir()
+    assert outcome(unpack_script(str(archive), str(area / "parent" / "dest"))) == ([], True)
+    assert files_below(area) == {
+        "parent": DIR, "parent/dest": DIR, "parent/dest/d": DIR, "parent/dest/d/f": FILE(b"1"),
+        "parent/dest/d/rel": LINK("f"), "parent/dest/g": FILE(b"2"),
+    }
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["existing-dest", "missing-dest-parent", "missing-archive", "not-gzip", "absolute-member", "dot-dot-member",
+     "no-tar-filter"],
+)
+def test_the_unpack_program_reports_each_failure_keeps_the_archive_and_leaves_no_dest(
+    area: Path, failure: str
+) -> None:
+    archive, dest = area / "a.tgz", area / "dest"
+    members: list[tuple[str, Node]] = [("ok", FILE(b"extracted first"))]
+    if failure == "absolute-member":
+        members.append((str(area / "escaped"), FILE(b"x")))
+    elif failure == "dot-dot-member":
+        members.append(("../escaped", FILE(b"x")))
+    data = b"not a gzip-compressed tar\n" * 8 if failure == "not-gzip" else make_archive(members)
+    if failure != "missing-archive":
+        archive.write_bytes(data)
+    if failure == "existing-dest":
+        dest.mkdir()
+        (dest / "mine").write_bytes(b"kept")
+    elif failure == "missing-dest-parent":
+        dest = area / "missing" / "dest"
+    expected = {
+        "existing-dest": ("EEXIST", str(dest)),
+        "missing-dest-parent": ("ENOENT", str(dest)),
+        "missing-archive": ("ENOENT", str(archive)),
+        "not-gzip": ("EIO", str(archive)),
+        "absolute-member": ("EIO", str(archive)),
+        "dot-dot-member": ("EIO", str(archive)),
+        "no-tar-filter": ("NOFILTER", None),
+    }[failure]
+    before = files_below(area)
+    errors, done = outcome(unpack_script(str(archive), str(dest)), tar_filter=failure != "no-tar-filter")
+    assert (errors, done) == ([expected], False)
+    assert files_below(area) == before
+
+
+def test_the_merge_program_renames_merges_directories_and_replaces_non_directories(area: Path) -> None:
+    for rel in ("s", "s/sub", "t", "t/sub", "d"):
+        (area / rel).mkdir()
+    (area / "s" / "sub" / "new").write_bytes(b"new")
+    (area / "s" / "file").write_bytes(b"replaces")
+    (area / "s" / "link").write_bytes(b"replaces the link")
+    (area / "t" / "file").write_bytes(b"old")
+    (area / "t" / "sub" / "kept").write_bytes(b"kept")
+    os.symlink("../d", area / "t" / "link")
+    assert outcome(merge_script(str(area / "s"), str(area / "t"))) == ([], True)
+    assert files_below(area) == {
+        "d": DIR, "t": DIR, "t/sub": DIR, "t/sub/new": FILE(b"new"), "t/sub/kept": FILE(b"kept"),
+        "t/file": FILE(b"replaces"), "t/link": FILE(b"replaces the link"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("at_src", "at_dst", "code"),
+    [("file", "dir", "EISDIR"), ("dir", "file", "ENOTDIR")],
+)
+def test_the_merge_program_reports_a_clash_about_the_deepest_destination_path(
+    area: Path, at_src: str, at_dst: str, code: str
+) -> None:
+    for rel in ("s", "s/sub", "t", "t/sub"):
+        (area / rel).mkdir()
+    for side, kind in (("s", at_src), ("t", at_dst)):
+        target = area / side / "sub" / "c"
+        if kind == "dir":
+            target.mkdir()
+            (target / "x").write_bytes(b"x")
+        else:
+            target.write_bytes(side.encode())
+    before = files_below(area)
+    assert outcome(merge_script(str(area / "s"), str(area / "t"))) == ([(code, str(area / "t" / "sub" / "c"))], False)
+    assert files_below(area) == before
+
+
+def test_the_merge_program_needs_no_tar_filter(area: Path) -> None:
+    (area / "s").mkdir()
+    (area / "s" / "f").write_bytes(b"1")
+    assert outcome(merge_script(str(area / "s"), str(area / "t")), tar_filter=False) == ([], True)
+    assert files_below(area) == {"t": DIR, "t/f": FILE(b"1")}
+
+
+def test_archive_scripts_ignore_a_python3_alias(area: Path) -> None:
+    (area / "src").mkdir()
+    (area / "src" / "f").write_bytes(b"1")
+    (area / "t").mkdir()
+    steps = [
+        (pack_script(str(area / "src"), ["f"], str(area / "a.tgz")), "@K"),
+        (unpack_script(str(area / "a.tgz"), str(area / "stage")), "@K"),
+        (merge_script(str(area / "stage"), str(area / "t")), "@K"),
+    ]
+    for script, expected in steps:
+        assert script is not None
+        _, output = run_in_hostile_bash(script)
+        assert "ALIASED" not in output and "HIJACKED" not in output, output
+        assert expected in output, output
+    assert files_below(area) == {"src": DIR, "src/f": FILE(b"1"), "t": DIR, "t/f": FILE(b"1")}

@@ -24,6 +24,30 @@ Semantics
       ``Unsupported`` before doing anything.
     * Backends raise only ``FsError`` subclasses. No raw ``OSError`` (or any
       other exception from the I/O layer) escapes a backend method.
+    * A backend may cache ``list_dir`` results (BttyBackend does; LocalBackend
+      and MemoryBackend do not). Only ``list_dir`` may answer from a cache:
+      ``stat``, ``exists`` and ``walk`` always ask the store, because the
+      engine's safety checks rest on them (so a caching backend overrides
+      ``walk``). A caching backend invalidates itself on its own mutations,
+      in a ``finally`` so that a call that raised (it may still have changed
+      something) invalidates too, dropping at least these listings ("the
+      subtree of p" is p and every directory below it)::
+
+        mkdir(p)                    the parent of p
+        delete(p), delete_many(ps)  the parent and the subtree of each path
+        rename(s, d)                the parents and the subtrees of s and d
+        copy_within(s, d)           the parent and the subtree of d
+        upload(local, p)            the parent of p
+        pack(parent, names, a)      the parent of a
+        unpack(a, dest)             the parent of a; the parent and the subtree of dest
+        merge(s, d)                 the parents and the subtrees of s and d
+
+      It never stores a listing that started before an invalidation and
+      finished after it, and every call returns a new list, so changing a
+      returned list changes nothing cached. ``invalidate`` drops listings on
+      request (Ctrl-R). Changes made to the store by anything else (an
+      editor, git, a build) stay invisible until then, and so does a change
+      made through another path to a directory reached through a symlink.
 """
 
 from __future__ import annotations
@@ -31,6 +55,7 @@ from __future__ import annotations
 import errno
 import posixpath
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
@@ -113,6 +138,7 @@ class Cap(Enum):
     COPY_WITHIN = "copy_within"  # copy_within
     UPLOAD = "upload"  # upload
     DOWNLOAD = "download"  # download
+    ARCHIVE = "archive"  # pack, unpack, merge
 
 
 ALL_CAPS: frozenset[Cap] = frozenset(Cap)
@@ -251,11 +277,33 @@ class Backend(ABC):
         Text for a panel header, e.g. ``"local"`` or ``"btty"``.
     caps
         The capabilities this instance offers; fixed for its lifetime.
+    archive_dir
+        A directory on this store where ``pack`` may write the archive of a
+        selection taken from this store, or ``None`` (the default) when the
+        store has none. The archive orchestrator reads it only from the
+        non-local side of an archive transfer, when that side is the source
+        (a LocalBackend's archives go in a fresh local temp directory); a
+        non-local source without one is transferred per file. It may be on
+        another filesystem than the selection, so an archive there is only
+        written by ``pack``, read by ``download`` and removed by ``delete``,
+        never renamed elsewhere. BttyBackend: ``Settings.remote_tmp``.
+    archive_max_bytes
+        The largest batch, in bytes, this store moves as one archive, or
+        ``None`` (the default) for no limit. Read from the non-local side of
+        an archive transfer: when the scan's total size of the regular files
+        (uncompressed) or the size of the packed archive exceeds it, the
+        batch is transferred per file instead. BttyBackend:
+        ``Settings.archive_max_bytes``.
+
+    All five are read-only for callers and fixed for the instance's
+    lifetime; a subclass sets them as class or instance attributes.
     """
 
     id: str
     label: str
     caps: frozenset[Cap]
+    archive_dir: str | None = None
+    archive_max_bytes: int | None = None
 
     # -- pure path algebra: no I/O, never raises FsError ---------------------
 
@@ -348,6 +396,21 @@ class Backend(ABC):
         error is raised. Deleting the root ``/`` raises OperationFailed.
         """
 
+    def delete_many(self, paths: Sequence[str], recursive: bool = False) -> None:
+        """``delete(path, recursive)`` for each of ``paths``, in order.
+
+        Needs Cap.DELETE, checked before anything is deleted, even when
+        ``paths`` is empty. Stops at the first failure and raises it: what
+        was already removed stays removed and the later paths are not
+        attempted. The default calls ``delete`` once per path. A backend may
+        override it to do the work in fewer round trips with the same
+        result, and may then refuse the whole call before deleting anything
+        (BttyBackend does so for the root ``/`` and for over-long paths).
+        """
+        self.require(Cap.DELETE, paths[0] if paths else self.home())
+        for path in paths:
+            self.delete(path, recursive)
+
     @abstractmethod
     def rename(self, src: str, dst: str, overwrite: bool = False) -> None:
         """Move ``src`` (any kind, a whole tree for a directory) to the full
@@ -402,6 +465,147 @@ class Backend(ABC):
         AlreadyExists unless ``overwrite``; IsADirectory if it is a directory;
         otherwise it is replaced. Modification time and mode are not
         necessarily preserved.
+        """
+
+    # -- archives (Cap.ARCHIVE): one transfer for a whole batch -----------------
+    #
+    # A backend lacking Cap.ARCHIVE needs no code: these defaults raise
+    # Unsupported. A backend claiming it overrides all three.
+
+    def pack(self, parent: str, names: Sequence[str], archive: str) -> None:
+        """Write the entries ``names`` inside directory ``parent`` to the new
+        file ``archive`` on this backend, as one gzip-compressed tar.
+
+        Needs Cap.ARCHIVE. ``names`` are single path components (no ``/``),
+        any number of them, each an entry directly inside ``parent``; a
+        symlink to a directory at ``parent`` is followed, as by list_dir. A
+        backend whose commands have a size limit still writes one archive
+        holding every name. No names gives an archive with no members.
+
+        The format is what Python's ``tarfile`` writes in mode ``"w:gz"``
+        with ``compresslevel=6`` and its default (PAX) format, so any
+        backend's ``unpack`` reads any backend's archive:
+
+        * members are named relative to ``parent``: ``name`` for a selected
+          entry, ``name/<path inside it>`` below a selected directory; never
+          absolute, never with a ``..`` component;
+        * a directory is added with everything below it, itself first;
+        * a symlink is stored as a link holding its link text unchanged and
+          is never followed, whether selected or below a selected directory;
+        * entries of kind ``"other"`` (fifo, socket, device) are left out
+          without an error, whether selected or below a selected directory;
+        * permission bits and mtime are recorded, ownership is not: uid and
+          gid are 0, uname and gname are empty.
+
+        AlreadyExists if anything exists at ``archive``, which is left
+        unchanged. NotFound if the parent of ``archive`` is missing, or if
+        ``parent`` or one of ``names`` is missing (about that path).
+        NotADirectory if ``parent`` is not a directory. Unsupported, with
+        nothing written, when this backend cannot pack this request
+        (BttyBackend: a remote python3 without ``tarfile.tar_filter``, or a
+        command that cannot fit its size limit); the caller then transfers
+        per file. Whatever the failure, a partial archive the call wrote is
+        removed (what was at ``archive`` before is never touched); a timeout
+        or a lost connection may still leave one behind, so the caller
+        treats ``archive`` as its own temporary and deletes it afterwards,
+        ignoring NotFound. The packed entries never change.
+        """
+        self.require(Cap.ARCHIVE, parent)
+        raise Unsupported(
+            parent, f"{Cap.ARCHIVE.value} is not implemented by {self.label}", self.id
+        )
+
+    def unpack(self, archive: str, dest: str) -> None:
+        """Extract the archive file ``archive``, as ``pack`` writes it, into
+        the new directory ``dest`` on this backend, then remove ``archive``.
+
+        Needs Cap.ARCHIVE. The call creates ``dest``: AlreadyExists if
+        anything exists at ``dest``, NotFound (about ``dest``) if its parent
+        is missing. A member named ``a/b`` ends up at ``dest/a/b``.
+        Extraction follows Python's ``tarfile`` "tar" filter with the owner
+        fields cleared:
+
+        * a member with an absolute name, or one that would end up outside
+          ``dest`` (through ``..`` or through a symlink extracted earlier),
+          raises OperationFailed. The "tar" filter alone strips a leading
+          ``/`` instead of refusing it, so implementations check for
+          absolute names themselves;
+        * a symlink is recreated as a link with its link text unchanged,
+          even an absolute one or one pointing outside ``dest`` (the
+          stricter "data" filter, which refuses those, is not used);
+        * files and directories get the recorded mtime and permission bits,
+          minus setuid, setgid, sticky and group/other write;
+        * ownership is never restored: uid, gid, uname and gname are set to
+          None before extraction, so everything belongs to the user running
+          it, even when that user is root.
+
+        On success ``archive`` is removed. On any failure ``dest`` is
+        removed with whatever was extracted, ``archive`` is kept and the
+        error is raised: NotFound if ``archive`` is missing, OperationFailed
+        if it is not an archive ``pack`` could have written (corrupt,
+        truncated, not gzip). Unsupported, with ``dest`` never created, when
+        this backend cannot extract with these semantics (BttyBackend: a
+        remote python3 without ``tarfile.tar_filter``); the caller then
+        transfers per file. As with ``pack``, a timeout or a lost connection
+        may still leave ``dest`` behind, and the caller deletes it.
+        """
+        self.require(Cap.ARCHIVE, archive)
+        raise Unsupported(
+            archive, f"{Cap.ARCHIVE.value} is not implemented by {self.label}", self.id
+        )
+
+    def merge(self, src: str, dst: str) -> None:
+        """Move ``src`` to the full path ``dst`` on this backend, merging
+        directories: how an archive transfer moves its staging directory
+        into the target.
+
+        Needs Cap.ARCHIVE. Kinds are taken by lstat at both ends, so a
+        symlink is never followed, at ``src`` or at ``dst``. It never asks
+        (the caller resolved conflicts before packing) and never copies:
+        every step is a rename within this backend::
+
+            at src / at dst                result
+            anything / nothing             src is renamed to dst
+            directory / directory          each entry of src is merged into
+                                           dst/<name> by these same rules,
+                                           then src, now empty, is removed;
+                                           the directory at dst stays, with
+                                           its own mode
+            non-directory / non-directory  dst is replaced by src (a symlink
+                                           at dst is replaced, not followed)
+            non-directory / directory      IsADirectory
+            directory / non-directory      NotADirectory
+
+        A clash is raised about the deepest path concerned (the ``dst/...``
+        path where it was found). Entries are merged in no particular order.
+        The first error stops the merge and is raised: what was already
+        moved stays moved, and ``src`` keeps the rest (a directory of
+        ``src`` is removed only once empty). NotFound if nothing is at
+        ``src`` or the parent of ``dst`` is missing. OperationFailed, before
+        anything moves, if ``dst`` is ``src`` or lies below it (compared as
+        paths). A rename across filesystems fails with OperationFailed, so
+        the caller keeps ``src`` on the filesystem of ``dst`` (it stages
+        inside the target directory).
+        """
+        self.require(Cap.ARCHIVE, src)
+        raise Unsupported(
+            src, f"{Cap.ARCHIVE.value} is not implemented by {self.label}", self.id
+        )
+
+    # -- listing cache ----------------------------------------------------------
+
+    def invalidate(self, path: str | None = None) -> None:
+        """Drop cached ``list_dir`` results for directory ``path`` and every
+        directory below it (``path`` and the paths starting with
+        ``path + "/"``; ``/`` means all of them), or for every directory when
+        ``path`` is None, so that the next ``list_dir`` of each asks the
+        store. The listing of the parent of ``path`` is kept.
+
+        Needs no capability, does no I/O, changes nothing on the store and
+        does not raise. Safe from any thread at any time, also while a
+        ``list_dir`` of an affected directory runs (that listing is then not
+        cached). The default does nothing: a backend without a cache (see
+        Semantics) has nothing to drop.
         """
 
     def close(self) -> None:

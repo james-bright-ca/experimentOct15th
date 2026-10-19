@@ -335,6 +335,160 @@ def test_invalid_settings_raise_value_error_naming_the_field(field: str, value: 
         Settings(**{field: value})  # type: ignore[arg-type]
 
 
+# -- the archive settings ([W2]: tmp, archive_timeout, archive_max_bytes) -----------------------
+
+
+def test_the_archive_settings_default_to_tmp_900_seconds_and_256_mib() -> None:
+    for settings in (Settings(), load_settings()):
+        assert settings.remote_tmp == "/tmp"
+        assert settings.btty_archive_timeout == 900
+        assert settings.archive_max_bytes == 268435456 == 256 * 1024 * 1024
+
+
+def test_the_archive_keys_are_read_from_the_btty_table(tmp_path: Path) -> None:
+    path = write(
+        tmp_path / "c.toml",
+        """
+        [btty]
+        tmp = "/var/tmp/twinfm/"
+        archive_timeout = 30
+        archive_max_bytes = 1000
+        """,
+    )
+    settings = load_settings(path)
+    assert (settings.remote_tmp, settings.btty_archive_timeout, settings.archive_max_bytes) == (
+        "/var/tmp/twinfm",
+        30,
+        1000,
+    )
+    # The other keys keep their defaults, and the archive keys do not touch them.
+    assert (settings.remote_home, settings.btty_exec, settings.btty_timeout) == (WORKSPACES_HOME, True, 120)
+    assert settings == Settings(remote_tmp="/var/tmp/twinfm", btty_archive_timeout=30, archive_max_bytes=1000)
+
+
+def test_every_key_of_the_btty_table_together(tmp_path: Path) -> None:
+    path = write(
+        tmp_path / "c.toml",
+        """
+        [btty]
+        home = "/srv/work/"
+        command = "/opt/bin/btty"
+        exec = false
+        timeout = 300
+        tmp = "/scratch/"
+        archive_timeout = 1800
+        archive_max_bytes = 1073741824
+        """,
+    )
+    assert load_settings(path) == Settings(
+        remote_home="/srv/work",
+        btty_command="/opt/bin/btty",
+        btty_exec=False,
+        btty_timeout=300,
+        remote_tmp="/scratch",
+        btty_archive_timeout=1800,
+        archive_max_bytes=1073741824,
+    )
+
+
+@pytest.mark.parametrize(
+    ("tmp_value", "expected"),
+    [("/tmp/", "/tmp"), ("//x//y", "/x/y"), ("/x/./y/../z", "/x/z"), ("/", "/")],
+)
+def test_remote_tmp_is_normalised_without_a_trailing_slash(
+    tmp_path: Path, tmp_value: str, expected: str
+) -> None:
+    path = write(tmp_path / "c.toml", f'[btty]\ntmp = "{tmp_value}"\n')
+    assert load_settings(path).remote_tmp == expected
+    assert Settings(remote_tmp=tmp_value).remote_tmp == expected
+    assert load_settings(overrides={"remote_tmp": tmp_value}).remote_tmp == expected
+
+
+@pytest.mark.parametrize(
+    ("line", "key"),
+    [
+        ('tmp = "relative/tmp"', "tmp"),
+        ('tmp = ""', "tmp"),
+        ("tmp = 5", "tmp"),
+        ("tmp = ['/tmp']", "tmp"),
+        ("archive_timeout = 0", "archive_timeout"),
+        ("archive_timeout = -1", "archive_timeout"),
+        ("archive_timeout = true", "archive_timeout"),
+        ("archive_timeout = 1.5", "archive_timeout"),
+        ('archive_timeout = "900"', "archive_timeout"),
+        ("archive_max_bytes = 0", "archive_max_bytes"),
+        ("archive_max_bytes = -268435456", "archive_max_bytes"),
+        ("archive_max_bytes = true", "archive_max_bytes"),
+        ("archive_max_bytes = 2.5e8", "archive_max_bytes"),
+        ('archive_max_bytes = "256MiB"', "archive_max_bytes"),
+    ],
+)
+def test_an_invalid_archive_value_raises_an_error_naming_the_file_and_key(
+    tmp_path: Path, line: str, key: str
+) -> None:
+    path = write(tmp_path / "c.toml", f"[btty]\n{line}\n")
+    with pytest.raises(ConfigError) as err:
+        load_settings(path)
+    assert err.value.path == str(path)
+    assert str(path) in str(err.value)
+    assert re.search(rf"\b{key}\b", err.value.reason), err.value.reason
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("remote_tmp", "relative"),
+        ("remote_tmp", None),
+        ("remote_tmp", ""),
+        ("btty_archive_timeout", 0),
+        ("btty_archive_timeout", True),
+        ("btty_archive_timeout", 2.5),
+        ("archive_max_bytes", 0),
+        ("archive_max_bytes", -1),
+        ("archive_max_bytes", True),
+        ("archive_max_bytes", 1.0),
+    ],
+)
+def test_invalid_archive_settings_raise_value_error_naming_the_field(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=field):
+        Settings(**{field: value})  # type: ignore[arg-type]
+    if value is not None:  # an override of None means "not given"
+        with pytest.raises(ValueError, match=field):
+            load_settings(overrides={field: value})
+
+
+def test_archive_overrides_win_over_the_file_and_none_means_not_given(tmp_path: Path) -> None:
+    path = write(
+        tmp_path / "c.toml", '[btty]\ntmp = "/from/file"\narchive_timeout = 30\narchive_max_bytes = 1000\n'
+    )
+    settings = load_settings(
+        path,
+        overrides={"remote_tmp": "/cli/tmp/", "btty_archive_timeout": None, "archive_max_bytes": 5},
+    )
+    assert (settings.remote_tmp, settings.btty_archive_timeout, settings.archive_max_bytes) == (
+        "/cli/tmp",
+        30,
+        5,
+    )
+
+
+def test_settings_with_the_archive_fields_stay_frozen_and_hashable() -> None:
+    settings = Settings(remote_tmp="/x/", btty_archive_timeout=5, archive_max_bytes=7)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        settings.remote_tmp = "/y"  # type: ignore[misc]
+    same = Settings(remote_tmp="/x", btty_archive_timeout=5, archive_max_bytes=7)
+    assert settings == same and hash(settings) == hash(same)
+    variants = {
+        Settings(),
+        settings,
+        same,
+        Settings(remote_tmp="/y"),
+        Settings(btty_archive_timeout=6),
+        Settings(archive_max_bytes=8),
+    }
+    assert len(variants) == 5
+
+
 # -- the documented defaults (D1, D2) ------------------------------------------------------------
 
 

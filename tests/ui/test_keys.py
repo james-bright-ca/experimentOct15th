@@ -1,5 +1,8 @@
 """Esc followed by a digit does what the F-key of that number does (Esc 0 is
-F10), for terminals that send F-keys as media keys; F10 quits."""
+F10), for terminals that send F-keys as media keys; F10 quits.
+
+These use Pilot key names. What a legacy terminal's bytes become (a fast
+ESC+digit, macOS Option+digit) is covered in test_terminal_keys.py."""
 
 from __future__ import annotations
 
@@ -70,8 +73,10 @@ async def test_alt_digit_opens_what_the_f_key_opens(
         await pilot.press(f"f{digit}")
         await pilot.pause()
         by_f_key = _what_opened(app)
+        assert by_f_key[0] != "main", f"F{digit} opened nothing"
         await pilot.press("escape")
         await settle(pilot)
+        assert app.screen is app.main
 
         await pilot.press(f"alt+{digit}")
         await pilot.pause()

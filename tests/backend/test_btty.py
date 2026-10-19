@@ -1,32 +1,52 @@
 """BttyBackend: the shared contract in exec mode over the fake btty, the
 transfer-only mode, argv shapes, error mapping, chunked deletes, hostile
-names, btty's informational line, and the default runner.
+names, btty's informational line, the default runner, archives (pack, unpack,
+merge: timeouts, the names file, a remote python3 without tar filters) and
+the listing cache.
 
 Nothing here runs the real btty. A backend gets a FakeBtty
 (tests/backend/fake_btty.py), which emulates btty over a directory below
-tmp_path, or a ``Recorder``, which runs nothing at all. The default-runner
-tests patch ``subprocess.run``.
+tmp_path, or a ``Recorder`` or ``StubListing``, which run nothing at all.
+The default-runner tests patch ``subprocess.run``.
 
 Every test states ``btty_exec`` and ``remote_home`` explicitly, so it holds
 whatever ``Settings()`` defaults to (decisions D1/D2), except the PATH-guard
-test, which is about ``Settings()`` itself and holds in either mode.
+test, which is about ``Settings()`` itself and holds in either mode, and the
+registry test, which is about ``Settings()``'s caps.
 """
 
 from __future__ import annotations
 
+import base64
 import errno
 import json
 import os
+import posixpath
+import shlex
 import shutil
 import subprocess
+import tarfile
+import threading
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from tests.backend.contract import DIR, FILE, LINK, BackendContract, Node
-from tests.backend.fake_btty import INFO_LINE, FakeBtty, run_script, script_paths
+from tests.backend.contract import DIR, FILE, LINK, BackendContract, Node, make_archive
+from tests.backend.fake_btty import (
+    ARCHIVE_KINDS,
+    EXEC_FLAGS,
+    INFO_LINE,
+    FakeBtty,
+    run_script,
+    script_kind,
+    script_names,
+    script_paths,
+    settings_for,
+)
+from twinfm.backend import parse_location
 from twinfm.backend.base import (
     ALL_CAPS,
     AlreadyExists,
@@ -35,17 +55,34 @@ from twinfm.backend.base import (
     Cap,
     FsError,
     IsADirectory,
+    NotADirectory,
     NotFound,
     OperationFailed,
     PermissionDenied,
     Unsupported,
 )
 from twinfm.backend.btty import TRANSFER_CAPS, BttyBackend, open_btty, run_btty
-from twinfm.backend.btty_scripts import COMMAND_BUDGET, mkdir_script
+from twinfm.backend.btty_scripts import (
+    COMMAND_BUDGET,
+    copy_script,
+    delete_scripts,
+    list_script,
+    merge_script,
+    mkdir_script,
+    pack_list_script,
+    pack_script,
+    rename_script,
+    stat_script,
+    unpack_script,
+    walk_script,
+)
 from twinfm.config import Settings
 
 TIMEOUT = 37
 """A --timeout other than the default, so argv checks prove it is the configured one."""
+
+ARCHIVE_TIMEOUT = 613
+"""A btty_archive_timeout other than the default (900) and other than TIMEOUT."""
 
 BSCP_HOME = "/mnt/home0/wst/workspaces/jake.blow.clearwateranalytics.com"
 """The folder the user's bscp function copies into."""
@@ -69,14 +106,23 @@ class Recorder:
         return self.answer
 
 
+def _settings(remote: str, exec_mode: bool, kw: dict[str, object]) -> Settings:
+    values: dict[str, object] = {
+        "remote_home": remote,
+        "btty_exec": exec_mode,
+        "btty_timeout": TIMEOUT,
+        "btty_archive_timeout": ARCHIVE_TIMEOUT,
+        **kw,
+    }
+    return Settings(**values)  # type: ignore[arg-type]
+
+
 def exec_backend(remote: str, runner: Callable[[list[str]], tuple[int, str, str]], **kw: object) -> BttyBackend:
-    settings = Settings(remote_home=remote, btty_exec=True, btty_timeout=TIMEOUT, **kw)  # type: ignore[arg-type]
-    return BttyBackend(settings, runner=runner)
+    return BttyBackend(_settings(remote, True, kw), runner=runner)
 
 
 def transfer_backend(remote: str, runner: Callable[[list[str]], tuple[int, str, str]], **kw: object) -> BttyBackend:
-    settings = Settings(remote_home=remote, btty_exec=False, btty_timeout=TIMEOUT, **kw)  # type: ignore[arg-type]
-    return BttyBackend(settings, runner=runner)
+    return BttyBackend(_settings(remote, False, kw), runner=runner)
 
 
 def exec_argv(script: str, command: str = "btty") -> list[str]:
@@ -132,7 +178,7 @@ def local(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def fake(remote: str) -> Iterator[FakeBtty]:
-    fake = FakeBtty(remote, timeout=TIMEOUT)
+    fake = FakeBtty(remote, timeout=TIMEOUT, archive_timeout=ARCHIVE_TIMEOUT)
     yield fake
     assert fake.rejected == [], "a command over COMMAND_BUDGET was sent to btty"
 
@@ -142,30 +188,58 @@ def write(path: Path | str, data: bytes) -> str:
     return str(path)
 
 
+def members(path: str) -> dict[str, Node]:
+    """The members of the gzip tar at ``path`` (a local file) as contract nodes."""
+    result: dict[str, Node] = {}
+    with tarfile.open(path, "r:gz") as tar:
+        for info in tar.getmembers():
+            if info.isdir():
+                result[info.name] = DIR
+            elif info.issym():
+                result[info.name] = LINK(info.linkname)
+            else:
+                extracted = tar.extractfile(info)
+                assert extracted is not None, info.name
+                result[info.name] = FILE(extracted.read())
+    return result
+
+
 # -- the shared contract, exec mode -------------------------------------------------------
 
 
 class _BttyExecContract(BackendContract):
     """BackendContract on BttyBackend in exec mode over the fake; ``info`` is
-    the stream btty's informational line arrives on."""
+    the stream btty's informational line arrives on.
+
+    The fake's root holds the contract root (the remote home) and, beside
+    it, the remote_tmp directory, so that both lie inside the fake remote.
+    Both timeouts differ from the defaults, and the fake checks each call's.
+    """
 
     info: str | None = "stderr"
 
     @pytest.fixture
-    def root(self, tmp_path: Path) -> str:
-        root = tmp_path.resolve() / "remote"
-        root.mkdir()
-        return str(root)
+    def store(self, tmp_path: Path) -> str:
+        """The fake remote's root."""
+        store = tmp_path.resolve() / "remote"
+        (store / "home").mkdir(parents=True)
+        (store / "tmp").mkdir()
+        return str(store)
 
     @pytest.fixture
-    def fake(self, root: str) -> Iterator[FakeBtty]:
-        fake = FakeBtty(root, timeout=TIMEOUT, info=self.info)
+    def root(self, store: str) -> str:
+        return f"{store}/home"
+
+    @pytest.fixture
+    def fake(self, store: str) -> Iterator[FakeBtty]:
+        fake = FakeBtty(store, timeout=TIMEOUT, archive_timeout=ARCHIVE_TIMEOUT, info=self.info)
         yield fake
         assert fake.rejected == [], "a command over COMMAND_BUDGET was sent to btty"
+        assert "?" not in fake.kinds, "the fake was sent an argv it does not know"
 
     @pytest.fixture
-    def backend(self, root: str, fake: FakeBtty) -> BttyBackend:
-        return exec_backend(root, fake)
+    def backend(self, root: str, store: str, fake: FakeBtty) -> BttyBackend:
+        return BttyBackend(settings_for(fake, root, f"{store}/tmp"), runner=fake)
 
     def seed_dir(self, backend: Backend, path: str) -> None:
         os.mkdir(path)
@@ -186,6 +260,13 @@ class _BttyExecContract(BackendContract):
     ) -> None:
         assert backend.caps == ALL_CAPS
         assert backend.runner is fake
+
+    def test_the_archive_dir_is_remote_tmp_inside_the_fake_remote(
+        self, backend: BttyBackend, store: str, root: str
+    ) -> None:
+        assert backend.archive_dir == f"{store}/tmp" == backend.settings.remote_tmp
+        assert backend.archive_max_bytes == backend.settings.archive_max_bytes == 268435456
+        assert backend.home() == root
 
 
 class TestBttyBackendContract(_BttyExecContract):
@@ -228,6 +309,11 @@ class TestTransferOnly:
             "rename",
             "rename-missing",
             "copy_within",
+            "pack",
+            "pack-many-names",
+            "unpack",
+            "merge",
+            "merge-into-itself",
         ],
     )
     def test_everything_but_transfers_raises_unsupported_without_calling_the_runner(
@@ -238,6 +324,11 @@ class TestTransferOnly:
         f, d, new = write(f"{remote}/f", b"x"), f"{remote}/d", f"{remote}/new"
         os.mkdir(d)
         calls: dict[str, Callable[[], object]] = {
+            "pack": lambda: backend.pack(remote, ["f", "d"], f"{remote}/a.tgz"),
+            "pack-many-names": lambda: backend.pack(remote, [f"n{i:04d}" * 8 for i in range(200)], new),
+            "unpack": lambda: backend.unpack(f, new),
+            "merge": lambda: backend.merge(d, new),
+            "merge-into-itself": lambda: backend.merge(d, f"{d}/inside"),
             "list_dir": lambda: backend.list_dir(remote),
             "list_dir-missing": lambda: backend.list_dir(f"{remote}/missing"),
             "walk": lambda: backend.walk(remote),
@@ -554,9 +645,68 @@ class TestRefusedBeforeAnythingIsSent:
             lambda: backend.list_dir("/top/a\0b"),
             lambda: backend.delete("/top/a\0b"),
             lambda: backend.rename("/top/a", "/top/a\0b"),
+            lambda: backend.pack("/top/a\0b", ["x"], "/top/a.tgz"),
+            lambda: backend.unpack("/top/a.tgz", "/top/a\0b"),
+            lambda: backend.merge("/top/a\0b", "/top/b"),
         ):
             with pytest.raises(OperationFailed):
                 call()
+        assert runner.calls == []
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda b, long: b.pack(long, ["a"], "/top/a.tgz"),
+            lambda b, long: b.pack("/top", ["a"], long),
+            lambda b, long: b.pack(long, [f"name-{i:03d}" for i in range(200)], "/top/a.tgz"),
+            lambda b, long: b.unpack(long, "/top/out"),
+            lambda b, long: b.unpack("/top/a.tgz", long),
+            lambda b, long: b.merge(long, "/top/elsewhere"),
+            lambda b, long: b.merge("/top/elsewhere", long),
+        ],
+        ids=["pack-parent", "pack-archive", "pack-many-names", "unpack-archive", "unpack-dest",
+             "merge-src", "merge-dst"],
+    )
+    def test_an_archive_path_too_long_for_one_command_raises_unsupported(
+        self, call: Callable[[BttyBackend, str], object]
+    ) -> None:
+        # Unsupported, not OperationFailed: the caller then transfers per file.
+        runner = Recorder()
+        long = "/top/" + "/".join(["x" * 100] * 12)
+        with pytest.raises(Unsupported) as err:
+            call(exec_backend("/top", runner), long)
+        assert "too long" in err.value.message
+        assert runner.calls == []
+
+    @pytest.mark.parametrize(
+        "name",
+        ["", ".", "..", "a/b", "/abs", "trailing/", "nul\0byte"],
+        ids=["empty", "dot", "dot-dot", "slash", "absolute", "trailing-slash", "nul"],
+    )
+    def test_pack_refuses_a_name_that_is_not_a_single_component(self, name: str) -> None:
+        runner = Recorder()
+        with pytest.raises(OperationFailed):
+            exec_backend("/top", runner).pack("/top/src", ["ok", name, "fine"], "/top/a.tgz")
+        assert runner.calls == []
+
+    @pytest.mark.parametrize(
+        ("src", "dst"),
+        [
+            ("/top/s", "/top/s"),
+            ("/top/s", "/top/s/inside"),
+            ("/top/s", "/top/s/deep/er"),
+            ("/top/s", "/top/x/../s/inside"),
+            ("s", "s/inside"),
+            ("/top/s/", "/top/s"),
+            ("/", "/top/anything"),
+        ],
+    )
+    def test_merge_into_itself_or_its_subtree_is_refused_before_anything_is_sent(
+        self, src: str, dst: str
+    ) -> None:
+        runner = Recorder()
+        with pytest.raises(OperationFailed):
+            exec_backend("/top", runner).merge(src, dst)
         assert runner.calls == []
 
 
@@ -1022,12 +1172,799 @@ class TestDefaultRunner:
             assert found is not None and os.path.samefile(found, shim)
 
 
+def test_a_btty_location_with_default_settings_has_every_cap_and_transfer_only_has_two() -> None:
+    """[D1] parse_location("btty:", Settings()) builds a BttyBackend (with the
+    default runner, which construction never calls) in exec mode: every Cap,
+    ARCHIVE included. With exec off its caps are {UPLOAD, DOWNLOAD}."""
+    backend, path = parse_location("btty:", Settings())
+    assert isinstance(backend, BttyBackend)
+    assert backend.runner is run_btty
+    assert backend.caps == frozenset(Cap) == ALL_CAPS
+    assert Cap.ARCHIVE in backend.caps
+    assert path == "/mnt/home0/wst/workspaces"
+    transfer, path = parse_location("btty:", Settings(btty_exec=False))
+    assert isinstance(transfer, BttyBackend)
+    assert transfer.caps == frozenset({Cap.UPLOAD, Cap.DOWNLOAD})
+    assert transfer is not backend
+    assert path == "/mnt/home0/wst/workspaces"
+
+
 def test_open_btty_shares_one_backend_per_settings() -> None:
     settings = Settings(remote_home="/mnt/t19-shared", btty_exec=True)
     backend = open_btty(settings)
     assert open_btty(Settings(remote_home="/mnt/t19-shared", btty_exec=True)) is backend
     assert open_btty(Settings(remote_home="/mnt/t19-shared", btty_exec=False)) is not backend
     assert open_btty(Settings(remote_home="/mnt/t19-other", btty_exec=True)) is not backend
+
+
+# -- archives: timeouts, the names file, a remote without tar filters ---------------------------
+
+
+def packable(remote: str, count: int, folder: str = "src") -> tuple[str, list[str]]:
+    """A folder below ``remote`` holding ``count`` files with names that need
+    quoting, one unselected file and one subdirectory; (its path, the names)."""
+    path = f"{remote}/{folder}"
+    os.mkdir(path)
+    names = [f"report {i:03d} - it's *final* $(x).txt" for i in range(count)]
+    for name in names:
+        write(f"{path}/{name}", name.encode())
+    write(f"{path}/not selected", b"stays out")
+    return path, names
+
+
+class TestArchiveTimeouts:
+    @pytest.mark.parametrize(
+        ("timeout", "archive_timeout"),
+        [(TIMEOUT, ARCHIVE_TIMEOUT), (None, None)],
+        ids=["configured", "defaults-120-and-900"],
+    )
+    def test_pack_unpack_and_merge_carry_the_archive_timeout_and_every_other_exec_the_btty_timeout(
+        self, remote: str, local: Path, timeout: int | None, archive_timeout: int | None
+    ) -> None:
+        fake = FakeBtty(remote)  # checks no timeout itself: this test reads every argv
+        values: dict[str, object] = {"remote_home": remote, "btty_exec": True}
+        if timeout is not None:
+            values.update(btty_timeout=timeout, btty_archive_timeout=archive_timeout)
+        backend = BttyBackend(Settings(**values), runner=fake)  # type: ignore[arg-type]
+        expected_exec = str(timeout or 120)
+        expected_archive = str(archive_timeout or 900)
+
+        src, names = packable(remote, 150)
+        backend.list_dir(src)
+        backend.walk(src)
+        backend.stat(f"{src}/not selected")
+        backend.mkdir(f"{remote}/dest")
+        backend.copy_within(f"{src}/not selected", f"{remote}/copied")
+        backend.rename(f"{remote}/copied", f"{remote}/renamed")
+        backend.upload(write(local / "up", b"up"), f"{remote}/up")
+        backend.pack(src, names[:2], f"{remote}/few.tgz")
+        backend.pack(src, names, f"{remote}/all.tgz")
+        with pytest.raises(NotFound):
+            backend.pack(f"{remote}/missing", ["x"], f"{remote}/failed.tgz")
+        backend.unpack(f"{remote}/few.tgz", f"{remote}/stage")
+        backend.merge(f"{remote}/stage", f"{remote}/dest")
+        with pytest.raises(NotFound):
+            backend.merge(f"{remote}/stage", f"{remote}/dest")
+        with pytest.raises(NotFound):
+            backend.unpack(f"{remote}/few.tgz", f"{remote}/stage")
+        backend.delete(f"{remote}/renamed")
+        backend.delete_many([f"{remote}/up", f"{remote}/all.tgz"])
+
+        assert set(fake.kinds) >= {
+            "list", "walk", "stat", "mkdir", "copy", "rename", "delete", "put",
+            "pack", "pack-from-file", "unpack", "merge",
+        }
+        for argv, kind in zip(fake.calls, fake.kinds, strict=True):
+            if kind in ("put", "get"):
+                assert "--timeout" not in argv, argv
+                continue
+            body = argv[8].split("\n", 1)[1]
+            archive = body.startswith("python3 -I -c ") and shlex.split(body)[4] in ("p", "f", "u", "m")
+            assert (kind in ARCHIVE_KINDS) == archive, kind
+            assert argv[5:7] == ["--timeout", expected_archive if archive else expected_exec], (kind, argv[:7])
+        assert all(len(s.encode("utf-8")) <= COMMAND_BUDGET for s in fake.scripts)
+        assert fake.rejected == []
+
+
+class TestPackNamesFile:
+    def test_pack_with_200_names_writes_one_archive_holding_all_of_them(
+        self, remote: str, fake: FakeBtty
+    ) -> None:
+        src, names = packable(remote, 200)
+        assert pack_script(src, names, f"{remote}/a.tgz") is None, "the names must not fit one command"
+        backend = exec_backend(remote, fake)
+        backend.pack(src, names, f"{remote}/a.tgz")
+
+        assert members(f"{remote}/a.tgz") == {name: FILE(name.encode()) for name in names}
+        assert sorted(os.listdir(remote)) == ["a.tgz", "src"], "the names file was left behind"
+        assert fake.kinds == ["put", "pack-from-file"]
+        [put, exec_] = fake.calls
+        assert put[5] == f"{remote}/a.tgz.names"
+        assert script_paths(exec_[8]) == [f"{remote}/a.tgz", src, f"{remote}/a.tgz.names"]
+        assert all(len(s.encode("utf-8")) <= COMMAND_BUDGET for s in fake.scripts)
+        assert fake.rejected == []
+
+    def test_names_that_fit_go_inline_in_one_command(self, remote: str, fake: FakeBtty) -> None:
+        src, names = packable(remote, 3)
+        backend = exec_backend(remote, fake)
+        backend.pack(src, names, f"{remote}/a.tgz")
+        assert fake.kinds == ["pack"]
+        assert script_names(fake.scripts[0]) == names
+        assert members(f"{remote}/a.tgz") == {name: FILE(name.encode()) for name in names}
+
+    def test_hostile_names_survive_the_names_file(self, remote: str, fake: FakeBtty) -> None:
+        hostile = ["new\nline", "tab\there", " padded ", "back\\slash", "-leading", "ünïcødé-日本語", "$(echo pwned)"]
+        src, names = packable(remote, 120)
+        for name in hostile:
+            write(f"{src}/{name}", name.encode())
+        selection = names + hostile
+        exec_backend(remote, fake).pack(src, selection, f"{remote}/a.tgz")
+        assert fake.kinds == ["put", "pack-from-file"]
+        assert members(f"{remote}/a.tgz") == {name: FILE(name.encode()) for name in selection}
+        assert sorted(os.listdir(remote)) == ["a.tgz", "src"]
+
+    @pytest.mark.parametrize(
+        "failure",
+        ["missing-name", "missing-parent", "existing-archive", "parent-is-a-file", "missing-archive-dir"],
+    )
+    def test_a_failed_pack_from_a_names_file_leaves_no_names_file_and_no_new_archive(
+        self, remote: str, fake: FakeBtty, failure: str
+    ) -> None:
+        src, names = packable(remote, 200)
+        archive = f"{remote}/a.tgz"
+        parent = src
+        expected: type[FsError] = NotFound
+        if failure == "missing-name":
+            names = [*names[:100], "missing", *names[100:]]
+        elif failure == "missing-parent":
+            parent = f"{remote}/missing"
+        elif failure == "existing-archive":
+            write(archive, b"precious")
+            expected = AlreadyExists
+        elif failure == "parent-is-a-file":
+            parent = f"{src}/not selected"
+            expected = NotADirectory
+        else:
+            archive = f"{remote}/missing/a.tgz"
+        before = remote_tree(remote)
+        with pytest.raises(expected) as err:
+            exec_backend(remote, fake).pack(parent, names, archive)
+        if failure == "missing-name":
+            assert err.value.path == f"{src}/missing"
+        elif failure == "existing-archive":
+            assert err.value.path == archive
+        elif failure != "missing-archive-dir":
+            assert err.value.path == parent
+        assert remote_tree(remote) == before
+        if failure == "missing-archive-dir":
+            assert fake.kinds == ["put"]  # the names file had nowhere to go
+        else:
+            assert fake.kinds[:2] == ["put", "pack-from-file"]
+
+    def test_when_the_pack_command_never_runs_its_names_file_is_deleted(
+        self, remote: str, fake: FakeBtty
+    ) -> None:
+        src, names = packable(remote, 200)
+        before = remote_tree(remote)
+
+        def runner(argv: list[str]) -> tuple[int, str, str]:
+            if len(argv) == 9 and script_kind(argv[8]) == "pack-from-file":
+                fake.respond(1, "", "btty: the connection dropped\n")  # nothing runs
+            return fake(argv)
+
+        with pytest.raises(BackendUnavailable):
+            exec_backend(remote, runner).pack(src, names, f"{remote}/a.tgz")
+        assert fake.kinds == ["put", "pack-from-file", "delete"]
+        assert script_paths(fake.calls[2][8]) == [f"{remote}/a.tgz.names"]
+        assert remote_tree(remote) == before
+
+
+class TestArchiveRoundTrips:
+    @pytest.mark.parametrize("layout", ["selected-names", "inside-a-selected-folder"])
+    def test_hard_linked_files_survive_pack_then_unpack(
+        self, remote: str, fake: FakeBtty, layout: str
+    ) -> None:
+        # tarfile.add stores the second path to an inode as a hard-link
+        # member; pnpm stores and git checkouts are full of them.
+        src = f"{remote}/src"
+        os.mkdir(src)
+        if layout == "selected-names":
+            write(f"{src}/a", b"shared bytes")
+            os.link(f"{src}/a", f"{src}/b")
+            names, prefix = ["a", "b"], ""
+        else:
+            os.makedirs(f"{src}/pkg/sub")
+            write(f"{src}/pkg/a", b"shared bytes")
+            os.link(f"{src}/pkg/a", f"{src}/pkg/sub/b")
+            names, prefix = ["pkg"], "pkg/"
+        backend = exec_backend(remote, fake)
+        backend.pack(src, names, f"{remote}/a.tgz")
+        backend.unpack(f"{remote}/a.tgz", f"{remote}/out")
+        out = remote_tree(f"{remote}/out")
+        b = f"{prefix}sub/b" if prefix else "b"
+        assert out[f"{prefix}a"] == FILE(b"shared bytes")
+        assert out[b] == FILE(b"shared bytes")
+        assert not os.path.exists(f"{remote}/a.tgz")
+
+    def test_a_large_file_and_many_small_ones_round_trip_byte_for_byte(
+        self, remote: str, fake: FakeBtty
+    ) -> None:
+        src = f"{remote}/src"
+        os.makedirs(f"{src}/d")
+        big = os.urandom(3 * 1024 * 1024)
+        write(f"{src}/d/big.bin", big)
+        for i in range(300):
+            write(f"{src}/d/small-{i:03d}", f"{i}".encode())
+        backend = exec_backend(remote, fake)
+        backend.pack(src, ["d"], f"{remote}/a.tgz")
+        backend.unpack(f"{remote}/a.tgz", f"{remote}/out")
+        assert remote_tree(f"{remote}/out") == remote_tree(src)
+        assert fake.count("pack", "unpack") == 2
+
+
+class TestWithoutTarFilter:
+    """A remote python3 older than 3.12 (and 3.11.4) has no tarfile.tar_filter:
+    pack and unpack raise Unsupported and change nothing, so that the caller
+    transfers per file."""
+
+    @pytest.fixture
+    def old(self, remote: str) -> Iterator[FakeBtty]:
+        fake = FakeBtty(remote, timeout=TIMEOUT, archive_timeout=ARCHIVE_TIMEOUT, tar_filter=False)
+        yield fake
+        assert fake.rejected == []
+
+    def test_the_fake_remote_python3_really_lacks_the_filters(self) -> None:
+        probe = "python3 -I -c 'import tarfile as T;print(hasattr(T, \"tar_filter\"), hasattr(T, \"data_filter\"))'"
+        assert run_script(probe, tar_filter=False) == (0, "False False\n")
+        assert run_script(probe) == (0, "True True\n")
+
+    @pytest.mark.parametrize("count", [3, 200], ids=["inline", "names-file"])
+    def test_pack_raises_unsupported_and_writes_nothing(
+        self, remote: str, old: FakeBtty, count: int
+    ) -> None:
+        src, names = packable(remote, count)
+        before = remote_tree(remote)
+        with pytest.raises(Unsupported):
+            exec_backend(remote, old).pack(src, names, f"{remote}/a.tgz")
+        assert remote_tree(remote) == before
+        assert old.count("pack", "pack-from-file") == 1
+
+    def test_unpack_raises_unsupported_creates_no_dest_and_keeps_the_archive(
+        self, remote: str, old: FakeBtty
+    ) -> None:
+        data = make_archive([("d", DIR), ("d/f", FILE(b"1"))])
+        write(f"{remote}/a.tgz", data)
+        os.mkdir(f"{remote}/parent")
+        with pytest.raises(Unsupported):
+            exec_backend(remote, old).unpack(f"{remote}/a.tgz", f"{remote}/parent/dest")
+        assert remote_tree(remote) == {"a.tgz": FILE(data), "parent": DIR}
+
+    def test_merge_needs_no_tar_filter(self, remote: str, old: FakeBtty) -> None:
+        for rel in ("s", "s/sub", "t", "t/sub"):
+            os.mkdir(f"{remote}/{rel}")
+        write(f"{remote}/s/sub/new", b"n")
+        write(f"{remote}/t/sub/old", b"o")
+        exec_backend(remote, old).merge(f"{remote}/s", f"{remote}/t")
+        assert remote_tree(remote) == {"t": DIR, "t/sub": DIR, "t/sub/new": FILE(b"n"), "t/sub/old": FILE(b"o")}
+
+    def test_the_switch_can_change_between_calls(self, remote: str, old: FakeBtty) -> None:
+        src, names = packable(remote, 2)
+        backend = exec_backend(remote, old)
+        with pytest.raises(Unsupported):
+            backend.pack(src, names, f"{remote}/a.tgz")
+        old.tar_filter = True
+        backend.pack(src, names, f"{remote}/a.tgz")
+        assert members(f"{remote}/a.tgz") == {name: FILE(name.encode()) for name in names}
+
+
+# -- the listing cache ------------------------------------------------------------------------
+
+
+class StubListing:
+    """A runner that runs nothing: every list script gets one file entry named
+    ``in-<basename>``; each listed path is recorded. Any other call fails the test."""
+
+    def __init__(self) -> None:
+        self.listed: list[str] = []
+
+    def __call__(self, argv: Sequence[str]) -> tuple[int, str, str]:
+        assert len(argv) == 9 and script_kind(argv[8]) == "list", argv[:8]
+        [path] = script_paths(argv[8])
+        self.listed.append(path)
+        name = "in-" + (posixpath.basename(path) or "root")
+        record = {
+            "name": base64.b64encode(name.encode()).decode(),
+            "kind": "file", "size": 1, "mtime": 1.0, "mode": 0o644,
+            "link_target": None, "target_kind": None,
+        }
+        return 0, json_result(f"@J {json.dumps(record)}\r\n@K\r\n"), INFO_LINE + "\r\n"
+
+
+class DroppedAfter:
+    """Runs every call on ``fake``, then, for calls of ``kinds``, reports a
+    dropped connection: the remote did the work and the answer was lost."""
+
+    def __init__(self, fake: FakeBtty, kinds: set[str]) -> None:
+        self.fake, self.kinds = fake, kinds
+
+    def __call__(self, argv: list[str]) -> tuple[int, str, str]:
+        answer = self.fake(argv)
+        if self.fake.kinds[-1] in self.kinds:
+            return 1, "", f"{INFO_LINE}\r\nbtty: the connection dropped\n"
+        return answer
+
+
+def listed(backend: BttyBackend, fake: FakeBtty, path: str) -> tuple[set[str] | type[FsError], int]:
+    """(the names list_dir(path) gives, or the FsError class it raises; how many btty calls it made)."""
+    before = len(fake.calls)
+    try:
+        result: set[str] | type[FsError] = {e.name for e in backend.list_dir(path)}
+    except FsError as e:
+        result = type(e)
+    return result, len(fake.calls) - before
+
+
+DISK = None
+"""In a Mutation's ``after``: the names now on disk, whatever they are."""
+
+
+@dataclass
+class Mutation:
+    """One mutating call and the listings it must drop (base.py's table).
+
+    tree
+        What is on the remote first (relative paths).
+    act
+        The call, given (backend, remote, local directory).
+    after
+        Each directory whose listing the call must drop, relative to the
+        remote ("" for the remote itself), with what list_dir then gives: the
+        names, the FsError class it raises, or DISK. Each is listed (and so
+        cached) before the call, so it must exist then.
+    behind
+        Changes made behind the backend's back after the listings are cached
+        and before the call, so that a dropped listing differs from the cached one.
+    kind
+        The fake's kind of the call that changes the remote.
+    """
+
+    kind: str
+    tree: dict[str, Node]
+    act: Callable[[BttyBackend, str, Path], object]
+    after: dict[str, set[str] | type[FsError] | None]
+    behind: Callable[[str], object] = field(default=lambda remote: None)
+    raises: type[FsError] | None = None
+
+
+ARCHIVE_OF_F = make_archive([("f", FILE(b"from the archive"))])
+
+MUTATIONS: dict[str, Mutation] = {
+    "mkdir": Mutation(
+        "mkdir", {"a": DIR}, lambda b, r, l: b.mkdir(f"{r}/a/new"), {"a": {"new"}}
+    ),
+    "delete": Mutation(
+        "delete", {"a": DIR, "a/f": FILE(b"1"), "a/g": FILE(b"2")},
+        lambda b, r, l: b.delete(f"{r}/a/f"), {"a": {"g"}},
+    ),
+    "delete-recursive": Mutation(
+        "delete",
+        {"a": DIR, "a/sub": DIR, "a/sub/deep": DIR, "a/sub/deep/g": FILE(b"g"), "a/keep": FILE(b"k")},
+        lambda b, r, l: b.delete(f"{r}/a/sub", recursive=True),
+        {"a": {"keep"}, "a/sub": NotFound, "a/sub/deep": NotFound},
+    ),
+    "delete_many": Mutation(
+        "delete",
+        {"a": DIR, "a/f": FILE(b"1"), "b": DIR, "b/h": FILE(b"2"), "b/keep": FILE(b"k")},
+        lambda b, r, l: b.delete_many([f"{r}/a/f", f"{r}/b/h"]),
+        {"a": set(), "b": {"keep"}},
+    ),
+    "delete_many-recursive": Mutation(
+        "delete",
+        {"a": DIR, "a/sub": DIR, "a/sub/x": FILE(b"x"), "b": DIR, "b/sub": DIR, "b/sub/y": FILE(b"y")},
+        lambda b, r, l: b.delete_many([f"{r}/a/sub", f"{r}/b/sub"], recursive=True),
+        {"a": set(), "a/sub": NotFound, "b": set(), "b/sub": NotFound},
+    ),
+    "delete_many-stopped-by-a-failure": Mutation(
+        "delete",
+        {"a": DIR, "a/f": FILE(b"1"), "a/g": FILE(b"2")},
+        lambda b, r, l: b.delete_many([f"{r}/a/f", f"{r}/a/missing", f"{r}/a/g"]),
+        {"a": {"g"}},
+        raises=NotFound,
+    ),
+    "rename": Mutation(
+        "rename",
+        {"a": DIR, "a/sub": DIR, "a/sub/deep": DIR, "a/sub/deep/g": FILE(b"g"), "b": DIR},
+        lambda b, r, l: b.rename(f"{r}/a/sub", f"{r}/b/sub"),
+        {"a": set(), "a/sub": NotFound, "a/sub/deep": NotFound, "b": {"sub"}},
+    ),
+    "rename-onto-a-stale-listing": Mutation(
+        "rename",
+        {"a": DIR, "a/f": FILE(b"f"), "b": DIR, "b/t": DIR, "b/t/old": FILE(b"o")},
+        lambda b, r, l: b.rename(f"{r}/a/f", f"{r}/b/t"),
+        {"b/t": NotADirectory},
+        behind=lambda r: shutil.rmtree(f"{r}/b/t"),
+    ),
+    "copy_within": Mutation(
+        "copy",
+        {"a": DIR, "a/sub": DIR, "a/sub/x": FILE(b"x"), "b": DIR},
+        lambda b, r, l: b.copy_within(f"{r}/a/sub", f"{r}/b/copy"),
+        {"b": {"copy"}},
+    ),
+    "copy_within-onto-a-stale-listing": Mutation(
+        "copy",
+        {"a": DIR, "a/sub": DIR, "a/sub/x": FILE(b"x"), "b": DIR, "b/copy": DIR, "b/copy/old": FILE(b"o")},
+        lambda b, r, l: b.copy_within(f"{r}/a/sub", f"{r}/b/copy"),
+        {"b/copy": {"x"}},
+        behind=lambda r: shutil.rmtree(f"{r}/b/copy"),
+    ),
+    "upload": Mutation(
+        "put", {"a": DIR},
+        lambda b, r, l: b.upload(write(l / "up", b"up"), f"{r}/a/up"), {"a": {"up"}},
+    ),
+    "upload-overwrite": Mutation(
+        "put", {"a": DIR, "a/up": FILE(b"old")},
+        lambda b, r, l: b.upload(write(l / "up", b"new"), f"{r}/a/up", overwrite=True), {"a": {"up"}},
+    ),
+    "pack": Mutation(
+        "pack", {"a": DIR, "a/f": FILE(b"f"), "b": DIR},
+        lambda b, r, l: b.pack(f"{r}/a", ["f"], f"{r}/b/x.tgz"), {"b": {"x.tgz"}},
+    ),
+    "pack-from-a-names-file": Mutation(
+        "pack-from-file",
+        {"a": DIR, "b": DIR, **{f"a/{'n' * 40}{i:03d}": FILE(b"n") for i in range(60)}},
+        lambda b, r, l: b.pack(f"{r}/a", sorted(os.listdir(f"{r}/a")), f"{r}/b/x.tgz"),
+        {"b": {"x.tgz"}},
+    ),
+    "pack-stopped-by-a-failure": Mutation(
+        "pack", {"a": DIR, "a/f": FILE(b"f"), "b": DIR},
+        lambda b, r, l: b.pack(f"{r}/a", ["f", "missing"], f"{r}/b/x.tgz"),
+        {"b": {"behind"}},
+        behind=lambda r: write(f"{r}/b/behind", b"seen only after a fresh listing"),
+        raises=NotFound,
+    ),
+    "unpack": Mutation(
+        "unpack", {"a": DIR, "a/x.tgz": FILE(ARCHIVE_OF_F), "b": DIR},
+        lambda b, r, l: b.unpack(f"{r}/a/x.tgz", f"{r}/b/out"), {"a": set(), "b": {"out"}},
+    ),
+    "unpack-onto-a-stale-listing": Mutation(
+        "unpack", {"a": DIR, "a/x.tgz": FILE(ARCHIVE_OF_F), "b": DIR, "b/out": DIR, "b/out/old": FILE(b"o")},
+        lambda b, r, l: b.unpack(f"{r}/a/x.tgz", f"{r}/b/out"),
+        {"b/out": {"f"}},
+        behind=lambda r: shutil.rmtree(f"{r}/b/out"),
+    ),
+    "merge": Mutation(
+        "merge",
+        {"a": DIR, "a/sub": DIR, "a/sub/deep": DIR, "a/sub/deep/g": FILE(b"g"),
+         "b": DIR, "b/sub": DIR, "b/sub/other": FILE(b"o")},
+        lambda b, r, l: b.merge(f"{r}/a/sub", f"{r}/b/sub"),
+        {"a": set(), "a/sub": NotFound, "a/sub/deep": NotFound, "b": {"sub"}, "b/sub": {"deep", "other"}},
+    ),
+    "merge-to-a-free-path": Mutation(
+        "merge", {"a": DIR, "a/sub": DIR, "a/sub/x": FILE(b"x"), "b": DIR},
+        lambda b, r, l: b.merge(f"{r}/a/sub", f"{r}/b/moved"),
+        {"a": set(), "a/sub": NotFound, "b": {"moved"}},
+    ),
+    "merge-stopped-by-a-clash": Mutation(
+        "merge",
+        {"s": DIR, "s/a": FILE(b"a"), "s/b": FILE(b"b"), "s/clash": DIR, "s/clash/x": FILE(b"x"),
+         "t": DIR, "t/clash": FILE(b"old")},
+        lambda b, r, l: b.merge(f"{r}/s", f"{r}/t"),
+        {"s": DISK, "t": DISK},
+        raises=NotADirectory,
+    ),
+}
+
+
+class TestListingCache:
+    def test_two_listings_of_one_directory_run_btty_once(self, remote: str, fake: FakeBtty) -> None:
+        os.mkdir(f"{remote}/sub")
+        write(f"{remote}/sub/f", b"1")
+        backend = exec_backend(remote, fake)
+        first = backend.list_dir(f"{remote}/sub")
+        for spelling in (f"{remote}/sub", "sub", f"{remote}/sub/", f"{remote}/./sub", f"{remote}/x/../sub"):
+            assert backend.list_dir(spelling) == first, spelling
+        assert fake.count("list") == 1
+        assert [e.name for e in first] == ["f"]
+
+    def test_stat_walk_and_exists_ask_btty_every_time_and_see_outside_changes(
+        self, remote: str, fake: FakeBtty
+    ) -> None:
+        write(f"{remote}/f", b"1")
+        backend = exec_backend(remote, fake)
+        assert {e.name for e in backend.list_dir(remote)} == {"f"}
+        write(f"{remote}/g", b"made by an editor")
+        for _ in range(2):
+            assert {e.name for e in backend.walk(remote)} == {"f", "g"}
+            assert backend.stat(f"{remote}/g").size == len(b"made by an editor")
+            assert backend.exists(f"{remote}/g")
+        assert (fake.count("walk"), fake.count("stat")) == (2, 4)
+        # The listing stays as cached until something invalidates it.
+        assert {e.name for e in backend.list_dir(remote)} == {"f"}
+        assert fake.count("list") == 1
+
+    @pytest.mark.parametrize("outcome", ["returned", "dropped-after-the-work"])
+    @pytest.mark.parametrize("mutation", MUTATIONS.values(), ids=MUTATIONS.keys())
+    def test_each_mutation_drops_the_listings_it_may_have_changed(
+        self, remote: str, local: Path, fake: FakeBtty, mutation: Mutation, outcome: str
+    ) -> None:
+        for rel in sorted(mutation.tree, key=lambda r: (r.count("/"), r)):
+            kind, value = mutation.tree[rel]
+            path = f"{remote}/{rel}"
+            if kind == "dir":
+                os.mkdir(path)
+            else:
+                assert isinstance(value, bytes)
+                write(path, value)
+        dropped = outcome != "returned"
+        runner = DroppedAfter(fake, {mutation.kind}) if dropped else fake
+        backend = exec_backend(remote, runner)
+        for rel in mutation.after:
+            result, calls = listed(backend, fake, f"{remote}/{rel}".rstrip("/"))
+            assert isinstance(result, set) and calls == 1, (rel, result)
+        mutation.behind(remote)
+
+        raises = BackendUnavailable if dropped else mutation.raises
+        if raises is None:
+            mutation.act(backend, remote, local)
+        else:
+            with pytest.raises(raises):
+                mutation.act(backend, remote, local)
+        assert fake.count(mutation.kind) >= 1
+
+        for rel, expected in mutation.after.items():
+            path = f"{remote}/{rel}".rstrip("/")
+            result, calls = listed(backend, fake, path)
+            assert calls == 1, f"the listing of {rel!r} was not dropped"
+            if expected is DISK:
+                expected = set(os.listdir(path))
+            assert result == expected, rel
+
+    def test_a_listing_still_cached_after_a_mutation_elsewhere_is_served_from_the_cache(
+        self, remote: str, fake: FakeBtty
+    ) -> None:
+        # btty.py: every mutation drops "the listings it may have changed"; the
+        # user asked for a cache updated only when something changed. A
+        # listing the call cannot have changed survives it.
+        os.mkdir(f"{remote}/a")
+        os.mkdir(f"{remote}/elsewhere")
+        backend = exec_backend(remote, fake)
+        backend.list_dir(f"{remote}/elsewhere")
+        backend.mkdir(f"{remote}/a/new")
+        _, calls = listed(backend, fake, f"{remote}/elsewhere")
+        assert calls == 0
+
+    @pytest.mark.parametrize("name", HOSTILE, ids=repr)
+    def test_hostile_directory_names_are_cache_keys_like_any_other(
+        self, remote: str, fake: FakeBtty, name: str
+    ) -> None:
+        folder = f"{remote}/{name}"
+        os.mkdir(folder)
+        os.mkdir(f"{folder}/below")
+        backend = exec_backend(remote, fake)
+        assert listed(backend, fake, folder) == ({"below"}, 1)
+        assert listed(backend, fake, f"{folder}/below") == (set(), 1)
+        assert listed(backend, fake, folder) == ({"below"}, 0)
+        backend.mkdir(f"{folder}/new")
+        assert listed(backend, fake, folder) == ({"below", "new"}, 1)
+        write(f"{folder}/below/outside", b"x")
+        backend.invalidate(folder)
+        assert listed(backend, fake, f"{folder}/below") == ({"outside"}, 1)
+
+    # -- invalidate -------------------------------------------------------------------------
+
+    @staticmethod
+    def tree_of_listings(remote: str) -> list[str]:
+        dirs = ["d", "d/e", "d/e/f", "db", "d b", "x"]
+        for rel in dirs:
+            os.mkdir(f"{remote}/{rel}")
+        return [remote, *(f"{remote}/{rel}" for rel in dirs)]
+
+    def test_invalidate_of_a_directory_drops_it_and_everything_below_and_keeps_its_parent(
+        self, remote: str, fake: FakeBtty
+    ) -> None:
+        paths = self.tree_of_listings(remote)
+        backend = exec_backend(remote, fake)
+        for path in paths:
+            backend.list_dir(path)
+        assert backend.invalidate(f"{remote}/d") is None
+        again = {path: listed(backend, fake, path)[1] for path in paths}
+        assert again == {
+            remote: 0,  # the parent is kept
+            f"{remote}/d": 1,
+            f"{remote}/d/e": 1,
+            f"{remote}/d/e/f": 1,
+            f"{remote}/db": 0,  # shares a prefix, but is not below d
+            f"{remote}/d b": 0,
+            f"{remote}/x": 0,
+        }
+
+    @pytest.mark.parametrize("spelling", ["d", "{remote}/d/", "{remote}/x/../d", "{remote}//d"])
+    def test_invalidate_normalises_its_path_and_resolves_it_against_the_home(
+        self, remote: str, fake: FakeBtty, spelling: str
+    ) -> None:
+        paths = self.tree_of_listings(remote)
+        backend = exec_backend(remote, fake)
+        for path in paths:
+            backend.list_dir(path)
+        backend.invalidate(spelling.format(remote=remote))
+        assert listed(backend, fake, f"{remote}/d")[1] == 1
+        assert listed(backend, fake, f"{remote}/d/e")[1] == 1
+        assert listed(backend, fake, f"{remote}/x")[1] == 0
+
+    @pytest.mark.parametrize("everything", [None, "/"], ids=["no-path", "root"])
+    def test_invalidate_without_a_path_or_of_the_root_drops_every_listing(
+        self, remote: str, fake: FakeBtty, everything: str | None
+    ) -> None:
+        paths = self.tree_of_listings(remote)
+        backend = exec_backend(remote, fake)
+        for path in paths:
+            backend.list_dir(path)
+        if everything is None:
+            backend.invalidate()
+        else:
+            backend.invalidate(everything)
+        assert {path: listed(backend, fake, path)[1] for path in paths} == dict.fromkeys(paths, 1)
+
+    @pytest.mark.parametrize("exec_mode", [True, False], ids=["exec", "transfer-only"])
+    def test_invalidate_never_raises_and_never_calls_btty(self, exec_mode: bool) -> None:
+        runner = Recorder()
+        backend = (exec_backend if exec_mode else transfer_backend)("/top", runner)
+        for path in (None, "/", "/top", "/top/a\0b", "", "relative/dir", "..", "/nowhere/at/all"):
+            assert backend.invalidate(path) is None, path
+        assert backend.invalidate() is None
+        assert runner.calls == []
+
+    # -- concurrency ------------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "interference",
+        ["mkdir-in-it", "delete-in-it", "invalidate-it", "invalidate-all"],
+    )
+    def test_a_listing_that_overlaps_an_invalidation_is_not_kept(
+        self, remote: str, fake: FakeBtty, interference: str
+    ) -> None:
+        os.mkdir(f"{remote}/d")
+        write(f"{remote}/d/old", b"o")
+        fetched, release = threading.Event(), threading.Event()
+
+        def runner(argv: list[str]) -> tuple[int, str, str]:
+            answer = fake(argv)
+            if fake.kinds[-1] == "list" and not fetched.is_set():
+                fetched.set()  # the listing has read the remote: hold its answer back
+                assert release.wait(30), "the main thread never released the listing"
+            return answer
+
+        backend = exec_backend(remote, runner)
+        results: list[set[str]] = []
+        worker = threading.Thread(target=lambda: results.append({e.name for e in backend.list_dir(f"{remote}/d")}))
+        worker.start()
+        try:
+            assert fetched.wait(30), "the listing never reached btty"
+            if interference == "mkdir-in-it":
+                backend.mkdir(f"{remote}/d/new")
+            elif interference == "delete-in-it":
+                backend.delete(f"{remote}/d/old")
+            elif interference == "invalidate-it":
+                write(f"{remote}/d/new", b"made by an editor")
+                backend.invalidate(f"{remote}/d")
+            else:
+                write(f"{remote}/d/new", b"made by an editor")
+                backend.invalidate()
+        finally:
+            release.set()
+            worker.join(30)
+        assert not worker.is_alive()
+        assert results == [{"old"}]  # it started before the change
+        expected = set() if interference == "delete-in-it" else {"old", "new"}
+        assert listed(backend, fake, f"{remote}/d") == (expected, 1)
+
+    def test_a_listing_made_while_a_mutation_runs_is_dropped_when_the_mutation_ends(
+        self, remote: str, fake: FakeBtty
+    ) -> None:
+        os.mkdir(f"{remote}/d")
+        changed, release = threading.Event(), threading.Event()
+
+        def runner(argv: list[str]) -> tuple[int, str, str]:
+            answer = fake(argv)
+            if fake.kinds[-1] == "mkdir":
+                changed.set()  # the remote has changed; the call has not returned yet
+                assert release.wait(30)
+            return answer
+
+        backend = exec_backend(remote, runner)
+        worker = threading.Thread(target=backend.mkdir, args=(f"{remote}/d/new",))
+        worker.start()
+        try:
+            assert changed.wait(30)
+            assert listed(backend, fake, f"{remote}/d") == ({"new"}, 1)
+            write(f"{remote}/d/later", b"made by an editor while the mkdir call was out")
+        finally:
+            release.set()
+            worker.join(30)
+        assert not worker.is_alive()
+        assert listed(backend, fake, f"{remote}/d") == ({"new", "later"}, 1)
+
+    def test_listings_from_many_threads_agree_and_stay_consistent(self, remote: str, fake: FakeBtty) -> None:
+        for i in range(4):
+            os.mkdir(f"{remote}/d{i}")
+            write(f"{remote}/d{i}/f", b"1")
+        backend = exec_backend(remote, fake)
+        errors: list[BaseException] = []
+
+        def work(i: int) -> None:
+            try:
+                for _ in range(5):
+                    assert {e.name for e in backend.list_dir(f"{remote}/d{i % 4}")} >= {"f"}
+                    backend.invalidate(f"{remote}/d{(i + 1) % 4}")
+            except BaseException as e:  # noqa: BLE001 - reported below
+                errors.append(e)
+
+        threads = [threading.Thread(target=work, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        assert errors == []
+        backend.invalidate()
+        for i in range(4):
+            assert listed(backend, fake, f"{remote}/d{i}") == ({"f"}, 1)
+
+    # -- size and copies --------------------------------------------------------------------
+
+    def test_the_256_most_recently_listed_directories_stay_cached(self) -> None:
+        stub = StubListing()
+        backend = exec_backend("/top", stub)
+        paths = [f"/top/d{i:03d}" for i in range(256)]
+        for path in paths:
+            backend.list_dir(path)
+        for path in reversed(paths):
+            assert [e.name for e in backend.list_dir(path)] == ["in-" + posixpath.basename(path)]
+        assert stub.listed == paths
+
+    def test_after_257_directories_the_first_one_listed_is_asked_again(self) -> None:
+        stub = StubListing()
+        backend = exec_backend("/top", stub)
+        paths = [f"/top/d{i:03d}" for i in range(257)]
+        for path in paths:
+            backend.list_dir(path)
+        backend.list_dir(paths[0])
+        assert stub.listed == [*paths, paths[0]]
+
+    def test_the_least_recently_used_listing_goes_first(self) -> None:
+        stub = StubListing()
+        backend = exec_backend("/top", stub)
+        paths = [f"/top/d{i:03d}" for i in range(256)]
+        for path in paths:
+            backend.list_dir(path)
+        backend.list_dir(paths[0])  # a hit: now the most recently used
+        backend.list_dir("/top/one-more")  # evicts paths[1], the least recently used
+        backend.list_dir(paths[0])
+        assert stub.listed == [*paths, "/top/one-more"]
+        backend.list_dir(paths[1])
+        assert stub.listed == [*paths, "/top/one-more", paths[1]]
+
+    def test_changing_a_returned_list_changes_nothing_cached(self, remote: str, fake: FakeBtty) -> None:
+        write(f"{remote}/a", b"1")
+        write(f"{remote}/b", b"2")
+        backend = exec_backend(remote, fake)
+        first = backend.list_dir(remote)
+        names = sorted(e.name for e in first)
+        first.clear()
+        second = backend.list_dir(remote)
+        assert sorted(e.name for e in second) == names
+        second.append(second[0])
+        second.reverse()
+        third = backend.list_dir(remote)
+        assert sorted(e.name for e in third) == names
+        assert third is not second
+        assert fake.count("list") == 1
+
+    def test_a_failed_listing_is_not_cached(self, remote: str, fake: FakeBtty) -> None:
+        backend = exec_backend(remote, fake)
+        with pytest.raises(NotFound):
+            backend.list_dir(f"{remote}/later")
+        os.mkdir(f"{remote}/later")
+        assert listed(backend, fake, f"{remote}/later") == (set(), 1)
 
 
 # -- the fake itself ------------------------------------------------------------------------------
@@ -1091,4 +2028,117 @@ class TestFakeBtty:
         code, _, stderr = FakeBtty(remote)(["btty", "--yes", "--get", f"{remote}/f", "--out", out])
         assert code == 1 and "already exists" in stderr
         assert Path(out).read_bytes() == b"local"
+
+    def test_it_knows_the_kind_and_the_paths_of_every_script(self) -> None:
+        a, b = "/r/it's a\npath", "/r/-other *"
+        scripts = {
+            "list": (list_script(a), [a]),
+            "walk": (walk_script(a), [a]),
+            "stat": (stat_script(a), [a]),
+            "mkdir": (mkdir_script(a), [a]),
+            "delete": (delete_scripts([a, b], recursive=True)[0][1], [a, b]),
+            "rename": (rename_script(a, b), [a, b]),
+            "copy": (copy_script(a, b, overwrite=True), [a, b]),
+            "pack": (pack_script(a, ["x y", "z"], b), [b, a]),
+            "pack-from-file": (pack_list_script(a, b + ".names", b), [b, a, b + ".names"]),
+            "unpack": (unpack_script(a, b), [a, b]),
+            "merge": (merge_script(a, b), [a, b]),
+        }
+        for kind, (script, paths) in scripts.items():
+            assert script is not None
+            assert script_kind(script) == kind
+            assert script_paths(script) == paths, kind
+        assert script_names(pack_script(a, ["x y", "z"], b) or "") == ["x y", "z"]
+        assert script_names(list_script(a)) == []
+
+    def test_it_checks_the_archive_timeout_for_archive_scripts_and_the_other_for_the_rest(
+        self, remote: str
+    ) -> None:
+        fake = FakeBtty(remote, timeout=TIMEOUT, archive_timeout=ARCHIVE_TIMEOUT)
+        merge = merge_script(f"{remote}/a", f"{remote}/b")
+        listing = list_script(remote)
+
+        def argv(script: str, timeout: int) -> list[str]:
+            return ["btty", *EXEC_FLAGS, str(timeout), "--exec", script]
+
+        with pytest.raises(AssertionError, match="merge --timeout 37 != archive timeout 613"):
+            fake(argv(merge, TIMEOUT))
+        with pytest.raises(AssertionError, match="--timeout 613 != 37"):
+            fake(argv(listing, ARCHIVE_TIMEOUT))
+        assert fake(argv(listing, TIMEOUT))[0] == 0
+        code, stdout, _ = fake(argv(merge, ARCHIVE_TIMEOUT))
+        assert "@X ENOENT" in stdout and code == 0
+        assert fake.kinds == ["?", "?", "list", "merge"]
+        assert fake.count("list", "merge") == 2
+        assert fake.calls_of("merge") == [argv(merge, ARCHIVE_TIMEOUT)]
+
+    @pytest.mark.parametrize(
+        "script",
+        [
+            lambda r, out: pack_script(r, ["x"], out),
+            lambda r, out: pack_script(out, ["x"], f"{r}/a.tgz"),
+            lambda r, out: pack_list_script(r, out, f"{r}/a.tgz"),
+            lambda r, out: unpack_script(f"{r}/a.tgz", out),
+            lambda r, out: unpack_script(out, f"{r}/dest"),
+            lambda r, out: merge_script(f"{r}/s", out),
+            lambda r, out: merge_script(out, f"{r}/t"),
+        ],
+        ids=["pack-archive", "pack-parent", "pack-names-file", "unpack-dest", "unpack-archive",
+             "merge-dst", "merge-src"],
+    )
+    def test_it_refuses_an_archive_path_outside_its_root_before_running_anything(
+        self, remote: str, tmp_path: Path, script: Callable[[str, str], str | None]
+    ) -> None:
+        outside = tmp_path.resolve() / "outside"
+        outside.mkdir()
+        write(outside / "a.tgz", make_archive([("x", FILE(b"x"))]))
+        for rel in ("s", "t"):
+            os.mkdir(f"{remote}/{rel}")
+        write(f"{remote}/x", b"x")
+        write(f"{remote}/a.tgz", make_archive([("x", FILE(b"x"))]))
+        before_outside, before_remote = remote_tree(str(outside)), remote_tree(remote)
+        text = script(remote, f"{outside}/a.tgz")
+        assert text is not None
+        fake = FakeBtty(remote)
+        with pytest.raises(AssertionError, match="outside the fake remote"):
+            fake(exec_argv(text))
+        assert remote_tree(str(outside)) == before_outside
+        assert remote_tree(remote) == before_remote
+
+    @pytest.mark.parametrize("name", ["../escaped", "/abs", "a/b", "..", "."])
+    def test_it_refuses_a_pack_name_that_could_leave_the_parent(
+        self, remote: str, local: Path, name: str
+    ) -> None:
+        os.mkdir(f"{remote}/src")
+        fake = FakeBtty(remote)
+        inline = pack_script(f"{remote}/src", ["ok", name], f"{remote}/a.tgz")
+        assert inline is not None
+        with pytest.raises(AssertionError, match="single path component"):
+            fake(exec_argv(inline))
+        write(f"{remote}/a.tgz.names", b"ok\0" + name.encode() + b"\0")
+        listed_names = pack_list_script(f"{remote}/src", f"{remote}/a.tgz.names", f"{remote}/a.tgz")
+        with pytest.raises(AssertionError, match="single path component"):
+            fake(exec_argv(listed_names))
+        assert remote_tree(remote) == {"src": DIR, "a.tgz.names": FILE(b"ok\0" + name.encode() + b"\0")}
+
+    def test_settings_for_matches_the_fake_and_keeps_both_directories_inside_it(
+        self, remote: str, tmp_path: Path
+    ) -> None:
+        fake = FakeBtty(remote, command="btty-x", timeout=TIMEOUT, archive_timeout=ARCHIVE_TIMEOUT)
+        settings = settings_for(fake, f"{remote}/home", f"{remote}/tmp")
+        assert settings == Settings(
+            remote_home=f"{remote}/home",
+            remote_tmp=f"{remote}/tmp",
+            btty_command="btty-x",
+            btty_exec=True,
+            btty_timeout=TIMEOUT,
+            btty_archive_timeout=ARCHIVE_TIMEOUT,
+        )
+        unchecked = settings_for(FakeBtty(remote), remote, remote, archive_max_bytes=10)
+        assert (unchecked.btty_timeout, unchecked.btty_archive_timeout) == (120, 900)
+        assert unchecked.archive_max_bytes == 10
+        with pytest.raises(AssertionError, match="outside the fake remote"):
+            settings_for(fake, remote, "/tmp")
+        with pytest.raises(AssertionError, match="outside the fake remote"):
+            settings_for(fake, str(tmp_path.resolve()), f"{remote}/tmp")
 

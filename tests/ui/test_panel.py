@@ -6,10 +6,13 @@ from __future__ import annotations
 import os
 
 import pytest
+from textual.widgets import Footer
+from textual.widgets._footer import FooterKey
 
 from tests.ui.conftest import FILES, LEFT_ORDER, Tree
 from tests.ui.support import (
     SIZE,
+    TRANSFER_ONLY,
     Notes,
     RecordingLocal,
     RecordingMemory,
@@ -231,3 +234,46 @@ async def test_status_line_shows_selected_count_and_total_size(
         text = str(status.content)
         assert "3 selected" in text, text
         assert "2,005" in text or "2005" in text, f"total size 2005 bytes not shown: {text!r}"
+
+
+# -- the footer --------------------------------------------------------------------------
+
+MAIN_KEYS = {"ctrl+r", "f4", "f5", "f6", "ctrl+n", "f7", "f8", "f9", "f10"}
+"""Every key the main screen's footer shows: ^R Refresh (the panel's), then
+F4 Edit, F5 Copy, F6 Move, ^N Rename, F7 Mkdir, F8 delete, F9 Connect, F10 Quit."""
+
+
+@pytest.mark.parametrize("focus", ["left", "right", "transfer-only"])
+@pytest.mark.parametrize("size", [(80, 24), SIZE], ids=["Terminal.app-default-80x24", "wide"])
+async def test_every_footer_key_lies_within_the_screen_width_on_the_bottom_line(
+    tree: Tree, local: RecordingLocal, engine: StubEngine, size: tuple[int, int], focus: str
+) -> None:
+    """At Terminal.app's default 80x24 window every main-screen footer key
+    is fully visible: inside the 80 columns, on the bottom line, no two keys
+    overlapping and the footer not scrolled sideways."""
+    right = (RecordingMemory(TRANSFER_ONLY, home="/drop"), "/drop") if focus == "transfer-only" else (local, tree.R)
+    app = make_app((local, tree.L), right, engine)
+    width, height = size
+    async with app.run_test(size=size) as pilot:
+        await settle(pilot)
+        if focus != "left":
+            await pilot.press("tab")
+            await pilot.pause()
+            assert app.active_panel is app.right_panel
+        footer = app.main.query_one(Footer)
+        keys = list(footer.query(FooterKey))
+        shown = [(k.key, k.key_display, k.description, k.region) for k in keys]
+
+        assert {k.key for k in keys} == MAIN_KEYS, shown
+        assert len(keys) == len(MAIN_KEYS), f"a key is shown twice: {shown}"
+        for key in keys:
+            region = key.region
+            text = key.render().plain
+            assert region.width > 0, f"{key.key} is not shown: {shown}"
+            assert region.x >= 0 and region.right <= width, f"{key.key} {region} is outside {width} columns: {shown}"
+            assert region.y == height - 1, f"{key.key} {region} is not on the bottom line"
+            assert key.key_display in text and key.description in text, f"{key.key} renders {text!r}"
+        ordered = sorted(keys, key=lambda k: k.region.x)
+        for before, after in zip(ordered, ordered[1:]):
+            assert before.region.right <= after.region.x, f"{before.key} overlaps {after.key}: {shown}"
+        assert footer.max_scroll_x == 0, f"the footer scrolls sideways by {footer.max_scroll_x}: {shown}"

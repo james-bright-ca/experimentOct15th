@@ -3,12 +3,17 @@
 The config file holds one table::
 
     [btty]
-    home = "/mnt/home0/wst/workspaces/..."   # remote home directory (absolute)
+    home = "/mnt/home0/wst/workspaces"       # remote home directory (absolute)
     command = "btty"                         # the btty executable
-    exec = false                             # allow btty --exec --allow-unrestricted
+    exec = true                              # btty --exec --allow-unrestricted; false: transfer-only
     timeout = 120                            # seconds, passed to btty --timeout
+    tmp = "/tmp"                             # remote directory for archives of remote selections
+    archive_timeout = 900                    # seconds, btty --timeout for pack, unpack and merge
+    archive_max_bytes = 268435456            # a larger batch is transferred per file
 
 Every key is optional. Other top-level tables are ignored.
+The values shown are the defaults: exec mode is on unless ``exec = false``,
+which leaves only single-file upload and download.
 """
 
 from __future__ import annotations
@@ -30,7 +35,7 @@ __all__ = [
     "load_settings",
 ]
 
-DEFAULT_REMOTE_HOME = "/mnt/home0/wst/workspaces/jake.blow.clearwateranalytics.com"
+DEFAULT_REMOTE_HOME = "/mnt/home0/wst/workspaces"
 CONFIG_ENV = "TWINFM_CONFIG"
 DEFAULT_CONFIG_PATH = "~/.config/twinfm/config.toml"
 
@@ -60,11 +65,20 @@ def _timeout(value: object) -> int:
     return value
 
 
+def _byte_count(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"must be a positive whole number of bytes, got {value!r}")
+    return value
+
+
 _FIELDS: dict[str, Callable[[object], Any]] = {
     "remote_home": _remote_home,
     "btty_command": _command,
     "btty_exec": _exec,
     "btty_timeout": _timeout,
+    "remote_tmp": _remote_home,
+    "btty_archive_timeout": _timeout,
+    "archive_max_bytes": _byte_count,
 }
 
 # config-file key in [btty] -> Settings field
@@ -73,6 +87,9 @@ _FILE_KEYS = {
     "command": "btty_command",
     "exec": "btty_exec",
     "timeout": "btty_timeout",
+    "tmp": "remote_tmp",
+    "archive_timeout": "btty_archive_timeout",
+    "archive_max_bytes": "archive_max_bytes",
 }
 
 
@@ -92,21 +109,43 @@ class Settings:
     remote_home
         Absolute remote directory the btty panel opens at and resolves relative
         remote paths against; stored without a trailing slash.
+        Default ``/mnt/home0/wst/workspaces``; ``home`` in ``[btty]`` or
+        ``--remote-home`` changes it.
     btty_command
         The btty executable, first element of every btty argv.
     btty_exec
-        Opt-in to ``btty --exec --allow-unrestricted`` (browse, delete, rename,
+        On by default: ``btty --exec --allow-unrestricted`` (browse, delete, rename,
         mkdir, folders). False means transfer-only: single-file put/get.
+        ``exec = false`` in ``[btty]`` or ``--no-btty-exec`` turns exec mode off.
     btty_timeout
-        Seconds passed to ``btty --timeout`` for exec commands.
+        Seconds passed to ``btty --timeout`` for exec commands other than
+        pack, unpack and merge.
+    remote_tmp
+        Absolute remote directory where archive mode packs a remote selection
+        before downloading it (the selection's own directory may be
+        read-only); stored normalised, without a trailing slash. The archive
+        is only written, downloaded and deleted there, never renamed into the
+        workspace (another filesystem). Default ``/tmp``; ``tmp`` in ``[btty]``.
+    btty_archive_timeout
+        Seconds passed to ``btty --timeout`` for the archive commands (pack,
+        unpack, merge), which can run far longer than the others. Default 900;
+        ``archive_timeout`` in ``[btty]``.
+    archive_max_bytes
+        The largest batch moved as one archive: when the selection's total
+        size or the packed archive is larger, the batch is transferred per
+        file instead. btty holds a whole transfer in memory, hence the
+        default of 268435456 (256 MiB); ``archive_max_bytes`` in ``[btty]``.
 
     Invalid values raise ValueError naming the field.
     """
 
     remote_home: str = DEFAULT_REMOTE_HOME
     btty_command: str = "btty"
-    btty_exec: bool = False
+    btty_exec: bool = True
     btty_timeout: int = 120
+    remote_tmp: str = "/tmp"
+    btty_archive_timeout: int = 900
+    archive_max_bytes: int = 268435456
 
     def __post_init__(self) -> None:
         for name, check in _FIELDS.items():

@@ -94,9 +94,13 @@ class FakeConnector:
 
 @dataclass
 class Call:
+    """One engine call. ``archive`` is the keyword copy and move were given
+    (False when the caller left it out); None for every other method."""
+
     name: str
     on_main_thread: bool
     args: tuple[Any, ...]
+    archive: bool | None = None
 
 
 @dataclass
@@ -108,6 +112,10 @@ class StubEngine:
     STAT) is a conflict asked through ``cb.ask_conflict``; a path listed in
     ``fail`` is an item error asked through ``cb.ask_error``. ``between`` is
     called with the item index after each item, on the worker thread.
+
+    copy / move take the keyword-only ``archive`` of the Engine protocol and
+    record it in ``Call.archive`` (see ``archives``); the stub transfers item
+    by item whatever it says.
     """
 
     calls: list[Call] = field(default_factory=list)
@@ -115,18 +123,40 @@ class StubEngine:
     fail: dict[str, FsError] = field(default_factory=dict)
     between: Callable[[int], None] | None = None
 
-    def _record(self, name: str, *args: Any) -> None:
-        self.calls.append(Call(name, on_main_thread(), args))
+    def _record(self, name: str, *args: Any, archive: bool | None = None) -> None:
+        self.calls.append(Call(name, on_main_thread(), args, archive))
 
     def names(self) -> list[str]:
         return [c.name for c in self.calls]
 
-    def copy(self, src: Backend, paths: Sequence[str], dst: Backend, target: str, cb: Callbacks) -> Report:
-        self._record("copy", src, list(paths), dst, target)
+    def archives(self) -> list[tuple[str, bool | None]]:
+        """``(name, archive)`` for every copy and move call, in order."""
+        return [(c.name, c.archive) for c in self.calls if c.name in ("copy", "move")]
+
+    def copy(
+        self,
+        src: Backend,
+        paths: Sequence[str],
+        dst: Backend,
+        target: str,
+        cb: Callbacks,
+        *,
+        archive: bool = False,
+    ) -> Report:
+        self._record("copy", src, list(paths), dst, target, archive=archive)
         return self._transfer("copy", src, paths, dst, target, cb)
 
-    def move(self, src: Backend, paths: Sequence[str], dst: Backend, target: str, cb: Callbacks) -> Report:
-        self._record("move", src, list(paths), dst, target)
+    def move(
+        self,
+        src: Backend,
+        paths: Sequence[str],
+        dst: Backend,
+        target: str,
+        cb: Callbacks,
+        *,
+        archive: bool = False,
+    ) -> Report:
+        self._record("move", src, list(paths), dst, target, archive=archive)
         return self._transfer("move", src, paths, dst, target, cb)
 
     def delete(self, b: Backend, paths: Sequence[str], cb: Callbacks) -> Report:

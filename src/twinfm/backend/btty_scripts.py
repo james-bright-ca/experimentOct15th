@@ -15,6 +15,14 @@ Every builder returns the text of one POSIX ``sh`` script for ``btty --exec``.
   ``python3`` and ``--exec --json`` work in the Beacon IDE. Without
   ``python3`` on the remote, listing fails with OperationFailed (exit
   status 127); there is no shell fallback.
+* Pack, unpack and merge (archive mode) each run one fixed ``python3``
+  program the same way: ``python3 -I -c <program> <op> <path>... [<name>...]``
+  with ``op`` ``p`` (pack, names inline), ``f`` (pack, names read from a
+  file), ``u`` (unpack) or ``m`` (merge). Every path is absolute; pack's
+  names are single path components, also ``shlex.quote``'d. Pack and unpack
+  use ``tarfile`` and need its extraction filters (``tarfile.tar_filter``:
+  Python 3.12, or a 3.8 to 3.11 patch release that backported them);
+  without them they print @X NOFILTER and change nothing.
 * The mutation scripts (mkdir, delete, rename, copy) are plain ``sh``. Each
   failure is classified by an explicit shell test (``[ -e ]``, ``[ -d ]``,
   ``[ -L ]``, ``[ -w ]``...), never by GNU or BSD message text. They use
@@ -30,7 +38,12 @@ Size budget
     OperationFailed about the offending path, and nothing is sent. Bulk deletes
     are split into as many scripts as needed (``delete_scripts``). The
     python3 program takes most of a listing script's budget, so list, walk
-    and stat accept quoted paths of up to about 270 bytes.
+    and stat accept quoted paths of up to about 270 bytes. An archive script
+    that would exceed the budget raises Unsupported instead, so that the
+    caller transfers per file; the archive programs leave about 500 bytes for
+    their quoted paths. Pack's names need not fit: when they do not,
+    ``pack_script`` returns None, and ``pack_list_script`` reads them from a
+    file uploaded next to the archive.
 
 Output records
     btty merges the remote stdout and stderr, so every record is one line
@@ -80,6 +93,8 @@ Output records
         one); when it is absent, the error is about the operation's own path.
         The python3 program prints the exception text as a noise line just
         before its @X. Its stat reports ENOTDIR as ENOENT, like the shell tests.
+        ``NOFILTER`` (no path), from pack or unpack, means the remote python3
+        lacks ``tarfile.tar_filter``; it maps to Unsupported.
     ``@K``
         The script ran to completion and succeeded. Output without ``@K`` or
         ``@X`` means the script did not finish.
@@ -107,6 +122,7 @@ from twinfm.backend.base import (
     NotFound,
     OperationFailed,
     PermissionDenied,
+    Unsupported,
 )
 
 __all__ = [
@@ -117,11 +133,15 @@ __all__ = [
     "delete_scripts",
     "error_for",
     "list_script",
+    "merge_script",
     "mkdir_script",
+    "pack_list_script",
+    "pack_script",
     "parse_output",
     "rename_script",
     "stat_script",
     "to_entry",
+    "unpack_script",
     "walk_script",
 ]
 
@@ -165,6 +185,90 @@ except OSError as x:
  if m=="s" and c=="ENOTDIR":c="ENOENT"
  print(x);print("@X",c,b(x.filename or b""))"""
 assert "'" not in _PY
+
+# The archive programs (Backend.pack, unpack and merge semantics), run as
+# `python3 -I -c <program> <op> <path>... [<name>...]`. Each prints @K, or the
+# exception text and an @X record. Paths are str (tarfile needs str names);
+# the remote python3 decodes argv with surrogateescape, so bytes round-trip.
+# None holds a single quote, as for _PY.
+#
+# _PACK, op p: <archive> <parent> <name>...; op f: <archive> <parent> <file>,
+# the file holding the names NUL-separated, which it reads and removes first.
+# It checks for the extraction filters before writing anything, so that a
+# remote that cannot unpack never packs either. The archive is created
+# exclusively (EEXIST if anything is there) and removed on any failure.
+_PACK = """\
+import os,sys,errno,base64,tarfile as T
+o,a,d,*n=sys.argv[1:]
+def x(c,p=""):print("@X",c,base64.b64encode(os.fsencode(p)).decode())
+def g(i):
+ if not i.isdev():i.uid=i.gid=0;i.uname=i.gname="";return i
+try:
+ if o=="f":
+  with open(n[0],"rb") as f:l=f.read()
+  os.remove(n[0]);n=[os.fsdecode(i) for i in l.split(b"\\0") if i]
+ if not hasattr(T,"tar_filter"):x("NOFILTER")
+ else:
+  os.chdir(d);t=T.open(a,"x:gz",compresslevel=6)
+  try:
+   with t:
+    for i in n:t.add(os.path.join(d,i),i,filter=g)
+  except BaseException:
+   os.remove(a);raise
+  print("@K")
+except OSError as e:print(e);x(errno.errorcode.get(e.errno,"EIO"),e.filename or "")"""
+assert "'" not in _PACK
+
+# _UNPACK, op u: <archive> <dest>. Creates dest, extracts with the "tar"
+# filter (which strips a leading "/" rather than refusing it, hence the
+# explicit check) and the owner fields cleared, then removes the archive. On
+# any failure after creating dest it removes dest and keeps the archive. A
+# corrupt or unsafe archive is @X EIO about the archive.
+# It reads the gzip stream to its end, past the end-of-archive block where
+# tar reading stops, so that gzip checks the CRC-32 and size trailer.
+_UNPACK = """\
+import os,sys,errno,base64,shutil,tarfile as T
+o,a,d=sys.argv[1:]
+def x(c,p=""):print("@X",c,base64.b64encode(os.fsencode(p)).decode())
+def f(m,p):
+ if m.name.startswith("/"):raise T.AbsolutePathError(m)
+ return T.tar_filter(m,p).replace(uid=None,gid=None,uname=None,gname=None,deep=False)
+try:
+ if not hasattr(T,"tar_filter"):x("NOFILTER")
+ else:
+  os.mkdir(d)
+  try:
+   with T.open(a,"r:gz") as t:
+    t.extractall(d,filter=f)
+    while t.fileobj.read(65536):pass
+   os.remove(a)
+  except BaseException:
+   shutil.rmtree(d,True);raise
+  print("@K")
+except OSError as e:print(e);x(errno.errorcode.get(e.errno,"EIO"),e.filename or "")
+except Exception as e:print(e);x("EIO",a)"""
+assert "'" not in _UNPACK
+
+# _MERGE, op m: <src> <dst>. Renames, merging directories (kinds by lstat): a
+# clash is EISDIR or ENOTDIR about the dst path where it was found, and the
+# first error stops it. The caller refuses a dst at or below src.
+_MERGE = """\
+import os,sys,errno,base64,stat as S
+o,s,d=sys.argv[1:]
+def x(c,p=""):print("@X",c,base64.b64encode(os.fsencode(p)).decode())
+D=lambda p:S.S_ISDIR(os.lstat(p).st_mode)
+def m(s,d):
+ try:t=D(d)
+ except FileNotFoundError:return os.rename(s,d)
+ if not D(s):
+  if t:raise IsADirectoryError(errno.EISDIR,"Is a directory",d)
+  return os.rename(s,d)
+ if not t:raise NotADirectoryError(errno.ENOTDIR,"Not a directory",d)
+ for i in os.listdir(s):m(os.path.join(s,i),os.path.join(d,i))
+ os.rmdir(s)
+try:m(s,d);print("@K")
+except OSError as e:print(e);x(errno.errorcode.get(e.errno,"EIO"),e.filename or "")"""
+assert "'" not in _MERGE
 
 # Prints @X <code> <base64 of $2>.
 _FAIL2 = 'x(){ echo "@X $1" $(printf %s "$2"|base64);}\n'
@@ -341,6 +445,58 @@ def copy_script(src: str, dst: str, overwrite: bool = False) -> str:
     return _transfer_script(src, dst, overwrite, action, rename=False)
 
 
+def _archive(program: str, op: str, paths: Sequence[str], names: Sequence[str] = ()) -> str:
+    words = [_q(p) for p in paths] + [shlex.quote(n) for n in names]
+    return f"{_HEAD}python3 -I -c {shlex.quote(program)} {op} {' '.join(words)}"
+
+
+def _fit_archive(script: str, path: str) -> str:
+    size = _size(script)
+    if size > COMMAND_BUDGET:
+        raise Unsupported(
+            path,
+            f"too long for one btty command ({size} of {COMMAND_BUDGET} bytes); "
+            "transfer it per file",
+        )
+    return script
+
+
+def pack_script(parent: str, names: Sequence[str], archive: str) -> str | None:
+    """Pack ``names`` (single components) inside directory ``parent`` into
+    the new gzip tar ``archive``, as ``Backend.pack`` specifies: @K, or @X
+    EEXIST (about ``archive``) / ENOENT / ENOTDIR (about ``parent``, or about
+    the entry at fault) / NOFILTER / .... None when the names do not fit in
+    one command: use ``pack_list_script``."""
+    script = _archive(_PACK, "p", [archive, parent], names)
+    return script if _size(script) <= COMMAND_BUDGET else None
+
+
+def pack_list_script(parent: str, names_file: str, archive: str) -> str:
+    """``pack_script`` with the names read from the remote file
+    ``names_file`` (each name's UTF-8 bytes, surrogateescape, separated by
+    NUL), which the program removes before anything else, also when it then
+    fails. Unsupported if it does not fit in one command."""
+    return _fit_archive(_archive(_PACK, "f", [archive, parent, names_file]), parent)
+
+
+def unpack_script(archive: str, dest: str) -> str:
+    """Extract ``archive`` into the new directory ``dest``, then remove
+    ``archive``, as ``Backend.unpack`` specifies: @K, or @X EEXIST / ENOENT /
+    ENOTDIR (about ``dest``, which is then not created) / NOFILTER, or after
+    ``dest`` was created and removed again: ENOENT (about ``archive``), EIO
+    (a corrupt archive or an unsafe member, the reason in the noise) ....
+    Unsupported if it does not fit in one command."""
+    return _fit_archive(_archive(_UNPACK, "u", [archive, dest]), archive)
+
+
+def merge_script(src: str, dst: str) -> str:
+    """Rename ``src`` to ``dst``, merging directories, as ``Backend.merge``
+    specifies: @K, or @X EISDIR / ENOTDIR (a clash, about the deepest dst
+    path) / ENOENT / EXDEV / .... It does not check that ``dst`` is outside
+    ``src``; the caller must. Unsupported if it does not fit in one command."""
+    return _fit_archive(_archive(_MERGE, "m", [src, dst]), src if len(src) >= len(dst) else dst)
+
+
 # -- parsers ---------------------------------------------------------------------
 
 
@@ -480,6 +636,12 @@ def error_for(
         where = where or path
         if code == "EINVAL":
             return OperationFailed(where, "cannot move or copy a directory into itself", backend_id)
+        if code == "NOFILTER":
+            return Unsupported(
+                where,
+                "the remote python3 has no tarfile.tar_filter (Python 3.12 or later is needed)",
+                backend_id,
+            )
         cls = _ERRORS.get(code)
         if cls is not None:
             return cls(where, None, backend_id)

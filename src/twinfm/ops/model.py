@@ -54,6 +54,12 @@ class Progress:
     bytes_done, bytes_total
         Byte counts when the engine knows them, else None. Backends transfer
         whole files, so progress is per item.
+    stage
+        None for per-item progress. In archive mode (see ``Engine.copy``) the
+        step the whole batch is in, as text for a UI to show unchanged:
+        ``"Packing"``, ``"Transferring"``, ``"Unpacking"`` and
+        ``"Merging"``, in that order. The other fields still hold
+        (``current`` is a source path of the batch) but say little then.
     """
 
     op: str
@@ -62,6 +68,7 @@ class Progress:
     items_total: int
     bytes_done: int | None = None
     bytes_total: int | None = None
+    stage: str | None = None
 
 
 @dataclass(slots=True)
@@ -119,12 +126,14 @@ class Callbacks(Protocol):
         ...
 
     def progress(self, p: Progress) -> None:
-        """Called before each work item starts."""
+        """Called before each work item starts, and in archive mode before
+        each stage (``Progress.stage``)."""
         ...
 
     def cancelled(self) -> bool:
-        """Polled between files, never in the middle of one. True stops the
-        batch as CANCEL does, with ``Report.cancelled`` True."""
+        """Polled between files, never in the middle of one (in archive
+        mode, between stages). True stops the batch as CANCEL does, with
+        ``Report.cancelled`` True."""
         ...
 
 
@@ -149,23 +158,83 @@ class Engine(Protocol):
     """
 
     def copy(
-        self, src: Backend, paths: Sequence[str], dst: Backend, target: str, cb: Callbacks
+        self,
+        src: Backend,
+        paths: Sequence[str],
+        dst: Backend,
+        target: str,
+        cb: Callbacks,
+        *,
+        archive: bool = False,
     ) -> Report:
         """Copy the entries at ``paths`` on ``src`` to ``target`` on ``dst``.
 
         Within one store a symlink is copied as a link. Between stores a
         symlink to a file is copied as its content and a symlink to a directory
         is reported skipped.
+
+        ``archive=True`` asks for archive mode, which moves the batch as one
+        gzip tar (``Backend.pack``, then ``upload`` or ``download``, then
+        ``unpack`` and ``merge``) instead of file by file. It applies only
+        when all of these hold: ``src is not dst``; both have Cap.ARCHIVE;
+        exactly one of them is a LocalBackend; and there are several
+        ``paths`` or the single one is a directory. Otherwise, and always
+        with the default ``archive=False``, each file is transferred on its
+        own as described above. In archive mode:
+
+        * symlinks, selected or inside a directory, are copied as links and
+          never followed; file modes (minus setuid, setgid, sticky and
+          group/other write) and mtimes are kept; ownership is not
+          restored; entries of kind ``"other"`` are reported skipped;
+        * the source and the destination are scanned before anything is
+          packed, and every conflict and file/directory clash goes through
+          ``cb`` then, with the rules and Report entries of the per-file
+          transfer, so CANCEL writes nothing. A destination that changes
+          after the scan is replaced at the merge without asking;
+        * the whole batch falls back to the per-file transfer, ending with
+          the tree and Report that ``archive=False`` gives, when ``pack``,
+          ``unpack`` or the first ``merge`` raises Unsupported, when the
+          scanned total size or the
+          packed archive's size exceeds the non-local side's
+          ``archive_max_bytes``, or when the non-local side is the source
+          and has no ``archive_dir``;
+        * a later ``merge`` that raises Unsupported leaves the items before
+          it merged (and done); that item and those after it then go per
+          file, replaying the answers already given;
+        * it falls back in the same way when the scan finds a directory
+          without owner read, write and search permission;
+        * temporaries in the stores' directories (the staging directory
+          inside the target directory, an archive next to it or in
+          ``archive_dir``) have names starting with ``.twinfm-``; local
+          archives go in a fresh temp directory. Every temporary is removed,
+          also on failure or cancel; one that cannot be is recorded in
+          ``Report.failed`` as OperationFailed "temporary file left behind";
+        * ``cb.cancelled()`` is polled between steps, and ``cb.progress``
+          reports each step as ``Progress.stage``.
         """
         ...
 
     def move(
-        self, src: Backend, paths: Sequence[str], dst: Backend, target: str, cb: Callbacks
+        self,
+        src: Backend,
+        paths: Sequence[str],
+        dst: Backend,
+        target: str,
+        cb: Callbacks,
+        *,
+        archive: bool = False,
     ) -> Report:
         """Like ``copy``, then the sources are removed; needs Cap.DELETE on
         ``src``. Between stores each source file is deleted only after its own
         transfer succeeded, source directories are removed bottom-up only when
-        empty, and nothing skipped or failed is deleted."""
+        empty, and nothing skipped or failed is deleted.
+
+        ``archive`` is as for ``copy``. In archive mode the sources are
+        deleted only after the merge returned: an item with nothing skipped
+        or failed inside it is deleted recursively; for any other item its
+        transferred files are deleted, then its directories bottom-up,
+        keeping any that still hold a skipped or failed entry. If the merge
+        raised, no source is deleted."""
         ...
 
     def delete(self, b: Backend, paths: Sequence[str], cb: Callbacks) -> Report:

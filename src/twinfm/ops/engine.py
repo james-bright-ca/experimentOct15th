@@ -10,6 +10,9 @@ How an item travels
     its own, with a conflict question when its destination exists. Between
     stores a file goes by ``dst.upload`` straight from a local source, or by
     ``src.download`` into a fresh temporary directory and then ``dst.upload``.
+    With ``archive=True`` a batch that qualifies for archive mode travels as
+    one archive instead (``twinfm.ops.archive``), and any other batch, or one
+    that falls back, as described here.
 
 Moves between stores, and merging moves
     Each source entry is deleted only after its own transfer succeeded.
@@ -258,6 +261,7 @@ def _transfer(
     target: str,
     cb: Callbacks,
     need_delete: bool,
+    archive: bool = False,
 ) -> Report:
     move = op == "move"
     paths = list(paths)
@@ -276,6 +280,13 @@ def _transfer(
     dests = plan.destinations(src, paths, dst, target)
     if src is dst:
         plan.refuse_onto_self(src, paths, dests, move)
+    elif archive:
+        from twinfm.ops import archive as archive_mode  # it imports this module
+
+        outcome = archive_mode.transfer(op, src, paths, dests, dst, cb)
+        if isinstance(outcome, Report):
+            return outcome
+        cb = outcome
 
     batch = _Batch(op, cb)
     planned: list[tuple[str, list[plan.WorkItem]]] = []
@@ -293,16 +304,32 @@ def _transfer(
     return batch.report
 
 
-def copy(src: Backend, paths: Sequence[str], dst: Backend, target: str, cb: Callbacks) -> Report:
+def copy(
+    src: Backend,
+    paths: Sequence[str],
+    dst: Backend,
+    target: str,
+    cb: Callbacks,
+    *,
+    archive: bool = False,
+) -> Report:
     """Copy the entries at ``paths`` on ``src`` to ``target`` on ``dst``
-    (see ``Engine.copy``)."""
-    return _transfer("copy", src, paths, dst, target, cb, need_delete=False)
+    (see ``Engine.copy``, also for ``archive``)."""
+    return _transfer("copy", src, paths, dst, target, cb, need_delete=False, archive=archive)
 
 
-def move(src: Backend, paths: Sequence[str], dst: Backend, target: str, cb: Callbacks) -> Report:
+def move(
+    src: Backend,
+    paths: Sequence[str],
+    dst: Backend,
+    target: str,
+    cb: Callbacks,
+    *,
+    archive: bool = False,
+) -> Report:
     """Move the entries at ``paths`` on ``src`` to ``target`` on ``dst``
-    (see ``Engine.move``). Needs Cap.DELETE on ``src``."""
-    return _transfer("move", src, paths, dst, target, cb, need_delete=True)
+    (see ``Engine.move``, also for ``archive``). Needs Cap.DELETE on ``src``."""
+    return _transfer("move", src, paths, dst, target, cb, need_delete=True, archive=archive)
 
 
 def delete(b: Backend, paths: Sequence[str], cb: Callbacks) -> Report:

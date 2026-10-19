@@ -1,6 +1,7 @@
 """Modal dialogs. Each is a ModalScreen whose result reaches the callback
-given to ``push_screen``: text input, yes/no confirmation, the per-file
-conflict and error questions, progress, and the end-of-batch failure summary.
+given to ``push_screen``: text input, the transfer target with the Archive
+checkbox, yes/no confirmation, the per-file conflict and error questions,
+progress, and the end-of-batch failure summary.
 
 Left/Right (and Tab) move between buttons, Enter presses the focused one and
 Esc gives the dialog's safe answer.
@@ -12,10 +13,11 @@ import time
 from collections.abc import Callable
 
 from textual.app import ComposeResult
+from textual.await_complete import AwaitComplete
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Label, Static
+from textual.widgets import Button, Checkbox, Input, Label, Static
 
 from twinfm.backend.base import Entry, FsError
 from twinfm.ops.model import Conflict, OnError, Progress, Report
@@ -28,6 +30,7 @@ __all__ = [
     "InputDialog",
     "ProgressDialog",
     "SummaryDialog",
+    "TransferDialog",
 ]
 
 
@@ -75,6 +78,15 @@ class Dialog[T](ModalScreen[T]):
         super().__init__()
         self._title = title
         self._answers: dict[str, T] = {}
+        self._dismissed = False
+
+    def dismiss(self, result: T | None = None) -> AwaitComplete:
+        """Close the dialog with ``result``. Only the first call counts: a
+        second one would pop whatever screen lies below the dialog."""
+        if self._dismissed:
+            return AwaitComplete.nothing()
+        self._dismissed = True
+        return super().dismiss(result)
 
     def body(self) -> ComposeResult:
         """The widgets between the title and the buttons."""
@@ -133,7 +145,50 @@ class InputDialog(Dialog[str | None]):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         event.stop()
+        event.prevent_default()  # Textual would run Dialog.on_button_pressed as well
         self.dismiss(self._input.value if event.button.id == "ok" else None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class TransferDialog(Dialog[tuple[str, bool] | None]):
+    """The target of a copy or move, as InputDialog asks for it, with the
+    Archive checkbox below the input, checked. The result is ``(text,
+    archive)``, or None if cancelled. Enter in the input accepts; on the
+    checkbox Enter and Space toggle it."""
+
+    AUTO_FOCUS = "Input"
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(self, title: str, prompt: str, value: str = "") -> None:
+        super().__init__(title)
+        self._prompt = prompt
+        self._input = Input(value=value)
+        self._archive = Checkbox("Archive folders and multiple items", value=True, compact=True)
+
+    def body(self) -> ComposeResult:
+        yield Label(self._prompt, markup=False)
+        yield self._input
+        yield self._archive
+
+    def buttons(self) -> list[tuple[str, str, tuple[str, bool] | None]]:
+        return [("ok", "OK", None), ("cancel", "Cancel", None)]
+
+    def _accept(self) -> None:
+        self.dismiss((self._input.value, self._archive.value))
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self._accept()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        event.prevent_default()  # Textual would run Dialog.on_button_pressed as well
+        if event.button.id == "ok":
+            self._accept()
+        else:
+            self.dismiss(None)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -231,8 +286,9 @@ class ErrorDialog(Dialog[OnError]):
 
 
 class ProgressDialog(Dialog[None]):
-    """Shows the item in progress. Esc calls ``on_cancel`` once: the batch
-    stops after the current file. The owner dismisses it when the batch ends."""
+    """Shows the item in progress, or the stage of an archive transfer
+    (``Progress.stage``). Esc calls ``on_cancel`` once: the batch stops
+    after the current file. The owner dismisses it when the batch ends."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
 
@@ -247,7 +303,10 @@ class ProgressDialog(Dialog[None]):
         yield self._hint
 
     def update_progress(self, p: Progress) -> None:
-        self._current.update(f"{p.items_done} of {p.items_total} done\n{p.current}")
+        if p.stage is not None:
+            self._current.update(f"{p.stage}\n{p.current}")
+        else:
+            self._current.update(f"{p.items_done} of {p.items_total} done\n{p.current}")
 
     def action_cancel(self) -> None:
         self._on_cancel()

@@ -68,10 +68,10 @@ class MemoryBackend(Backend):
     """An in-RAM POSIX-like tree (directories, files, symlinks) with lstat
     semantics, rooted at ``/``.
 
-    ``caps`` (default: every Cap) is fixed at construction; a method whose
-    capability is missing raises Unsupported and changes nothing. ``home`` is
-    created if missing. ``upload`` and ``download`` read and write real local
-    files. Thread-safe: every method holds one lock.
+    ``caps`` (default: every Cap except ARCHIVE) is fixed at construction; a
+    method whose capability is missing raises Unsupported and changes
+    nothing. ``home`` is created if missing. ``upload`` and ``download`` read
+    and write real local files. Thread-safe: every method holds one lock.
 
     The ``add_*``, ``read_file`` and ``snapshot`` helpers are not part of the
     Backend contract: they seed and inspect the tree for tests and ignore caps.
@@ -80,7 +80,11 @@ class MemoryBackend(Backend):
     id = "memory"
 
     def __init__(
-        self, caps: Iterable[Cap] = ALL_CAPS, *, home: str = "/", label: str = "memory"
+        self,
+        caps: Iterable[Cap] = ALL_CAPS - {Cap.ARCHIVE},
+        *,
+        home: str = "/",
+        label: str = "memory",
     ) -> None:
         self.caps = frozenset(caps)
         self.label = label

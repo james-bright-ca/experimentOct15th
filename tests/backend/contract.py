@@ -51,13 +51,29 @@ What the suite never does
 Sibling order from ``list_dir`` and ``walk`` is unspecified, so the suite
 compares sets. For ``walk`` it checks only that each directory comes before
 its contents.
+
+Archives (Cap.ARCHIVE)
+----------------------
+The pack / unpack / merge tests run only on a backend that claims
+Cap.ARCHIVE; every other backend checks instead that the three raise
+Unsupported and change nothing. They still use only the hooks: an archive
+``pack`` wrote is read back with ``observe`` (its bytes) and opened with
+``tarfile`` in memory, and an archive for ``unpack`` is built in memory with
+``make_archive`` and put on the store with ``seed_file``. Every archive and
+every extraction stays below ``root``, including what a broken backend would
+write for a hostile member name. Permission bits and mtimes are compared
+through ``stat``, so those tests also need Cap.STAT.
 """
 
 from __future__ import annotations
 
+import gzip
+import io
 import os
 import posixpath
-from collections.abc import Callable, Mapping
+import random
+import tarfile
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -75,7 +91,16 @@ from twinfm.backend.base import (
     Unsupported,
 )
 
-__all__ = ["DIR", "FILE", "HOSTILE_NAMES", "LINK", "BackendContract", "Node"]
+__all__ = [
+    "DIR",
+    "FILE",
+    "HOSTILE_NAMES",
+    "LINK",
+    "BackendContract",
+    "Node",
+    "archive_members",
+    "make_archive",
+]
 
 Node = tuple[str, bytes | str | None]
 """What ``observe`` reports for one path: DIR, FILE(data) or LINK(target)."""
@@ -107,6 +132,73 @@ HOSTILE_NAMES = [
     "ünïcødé-日本語",
 ]
 """File names that break naive shell quoting, globbing or option parsing."""
+
+
+ARCHIVE_MTIME = 1_000_000_000
+"""The mtime ``make_archive`` records unless told otherwise (2001-09-09)."""
+
+GZIP_MAGIC = b"\x1f\x8b"
+
+
+def make_archive(
+    members: Sequence[tuple[str, Node] | tuple[str, Node, int]], mtime: int = ARCHIVE_MTIME
+) -> bytes:
+    """A gzip tar in the format ``Backend.pack`` documents ("w:gz",
+    compresslevel 6, PAX, ownership zeroed), holding ``members`` in the order
+    given: ``(name, node)`` or ``(name, node, mode)``. The default mode is
+    0o755 for a directory, 0o644 for a file and 0o777 for a symlink."""
+    buffer = io.BytesIO()
+    with tarfile.open(
+        fileobj=buffer, mode="w:gz", compresslevel=6, format=tarfile.PAX_FORMAT
+    ) as tar:
+        for member in members:
+            name, (kind, value) = member[0], member[1]
+            info = tarfile.TarInfo(name)
+            info.mtime = mtime
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            content = None
+            if kind == "dir":
+                info.type, info.mode = tarfile.DIRTYPE, 0o755
+            elif kind == "file":
+                assert isinstance(value, bytes)
+                info.type, info.mode, info.size = tarfile.REGTYPE, 0o644, len(value)
+                content = io.BytesIO(value)
+            else:
+                assert isinstance(value, str)
+                info.type, info.mode, info.linkname = tarfile.SYMTYPE, 0o777, value
+            if len(member) == 3:
+                info.mode = member[2]  # type: ignore[misc]
+            tar.addfile(info, content)
+    return buffer.getvalue()
+
+
+def archive_members(data: bytes) -> list[tuple[tarfile.TarInfo, Node]]:
+    """Every member of the gzip tar ``data``, in archive order, with what it
+    holds as a contract node (DIR, FILE(content) or LINK(link text)). Any other
+    member type fails the test."""
+    assert data[:2] == GZIP_MAGIC, f"not gzip-compressed: {data[:16]!r}"
+    result: list[tuple[tarfile.TarInfo, Node]] = []
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+        for info in tar.getmembers():
+            if info.isdir():
+                node = DIR
+            elif info.isreg():
+                extracted = tar.extractfile(info)
+                assert extracted is not None
+                node = FILE(extracted.read())
+            elif info.issym():
+                node = LINK(info.linkname)
+            else:
+                raise AssertionError(f"unexpected member type {info.type!r} for {info.name!r}")
+            result.append((info, node))
+    return result
+
+
+def incompressible(size: int, seed: int) -> bytes:
+    """``size`` deterministic pseudo-random bytes (they do not compress, so a
+    cut through the archive lands inside a member)."""
+    return random.Random(seed).randbytes(size)
 
 
 class BackendContract:
@@ -179,6 +271,18 @@ class BackendContract:
     @staticmethod
     def assert_permission_bits(entry: Entry) -> None:
         assert entry.mode is None or entry.mode & ~0o7777 == 0, oct(entry.mode or 0)
+
+    def archive_bytes(self, backend: Backend, root: str, rel: str) -> bytes:
+        """The content of the regular file ``rel`` below ``root``, read with ``observe``."""
+        kind, data = self.observe(backend, root)[rel]
+        assert kind == "file" and isinstance(data, bytes), f"{rel} is a {kind}, not a file"
+        return data
+
+    @staticmethod
+    def below(tree: Mapping[str, Node], prefix: str) -> dict[str, Node]:
+        """The part of ``tree`` below the relative directory ``prefix``, relative to it."""
+        start = prefix + "/"
+        return {rel[len(start) :]: node for rel, node in tree.items() if rel.startswith(start)}
 
     # -- harness sanity ------------------------------------------------------------
 
@@ -991,13 +1095,804 @@ class BackendContract:
         backend.upload(str(local_tmp / "link"), self.at(root, "up"))
         assert self.observe(backend, root) == {"up": FILE(b"content")}
 
+    # -- delete_many ----------------------------------------------------------------------
+
+    def test_delete_many_deletes_each_path_in_the_order_given(
+        self, backend: Backend, root: str
+    ) -> None:
+        # Without recursive, d can go only once d/f and d/g are gone.
+        self.need(backend, Cap.DELETE)
+        self.seed(
+            backend,
+            root,
+            {"d": DIR, "d/f": FILE(b"1"), "d/g": FILE(b"2"), "x": FILE(b"x"), "keep": FILE(b"k")},
+        )
+        backend.delete_many(
+            [self.at(root, "d/f"), self.at(root, "d/g"), self.at(root, "d"), self.at(root, "x")]
+        )
+        assert self.observe(backend, root) == {"keep": FILE(b"k")}
+
+    def test_delete_many_recursive_removes_whole_trees(self, backend: Backend, root: str) -> None:
+        self.need(backend, Cap.DELETE)
+        self.seed(
+            backend,
+            root,
+            {
+                "a": DIR,
+                "a/b": DIR,
+                "a/b/f": FILE(b"1"),
+                "c": DIR,
+                "c/g": FILE(b"2"),
+                "keep": DIR,
+                "keep/h": FILE(b"3"),
+            },
+        )
+        backend.delete_many([self.at(root, "a"), self.at(root, "c")], recursive=True)
+        assert self.observe(backend, root) == {"keep": DIR, "keep/h": FILE(b"3")}
+
+    @pytest.mark.parametrize(
+        ("failing", "error"),
+        [("missing", NotFound), ("full", DirectoryNotEmpty)],
+        ids=["missing", "non-empty-directory"],
+    )
+    def test_delete_many_stops_at_the_first_failure_and_raises_it(
+        self, backend: Backend, root: str, failing: str, error: type[Exception]
+    ) -> None:
+        self.need(backend, Cap.DELETE)
+        self.seed(
+            backend,
+            root,
+            {"first": FILE(b"1"), "full": DIR, "full/f": FILE(b"2"), "last": FILE(b"3")},
+        )
+        with pytest.raises(error) as err:
+            backend.delete_many(
+                [self.at(root, "first"), self.at(root, failing), self.at(root, "last")]
+            )
+        assert err.value.path == self.at(root, failing)  # type: ignore[attr-defined]
+        # first stays deleted, the failing path is intact, last was never attempted.
+        assert self.observe(backend, root) == {
+            "full": DIR,
+            "full/f": FILE(b"2"),
+            "last": FILE(b"3"),
+        }
+
+    def test_delete_many_of_no_paths_changes_nothing(self, backend: Backend, root: str) -> None:
+        self.need(backend, Cap.DELETE)
+        self.seed(backend, root, {"f": FILE(b"1")})
+        assert backend.delete_many([]) is None
+        assert self.observe(backend, root) == {"f": FILE(b"1")}
+
+    # -- invalidate (the listing cache) ----------------------------------------------------
+
+    def test_invalidate_returns_none_and_changes_nothing(self, backend: Backend, root: str) -> None:
+        # It needs no capability, so this runs whatever the caps are.
+        self.seed(backend, root, {"d": DIR, "d/e": DIR, "d/e/f": FILE(b"1"), "g": FILE(b"2")})
+        before = self.observe(backend, root)
+        for path in (
+            root,
+            self.at(root, "d"),
+            self.at(root, "d/e"),
+            self.at(root, "g"),
+            self.at(root, "missing"),
+            "/",
+            None,
+        ):
+            assert backend.invalidate(path) is None, path
+        assert backend.invalidate() is None
+        assert self.observe(backend, root) == before
+
+    def test_after_invalidate_the_next_listing_asks_the_store(
+        self, backend: Backend, root: str
+    ) -> None:
+        # The hooks change the store behind the backend's back, as an editor
+        # would. A backend without a cache sees it at once; a caching one must
+        # see it after invalidate.
+        self.need(backend, Cap.LIST)
+        self.seed(backend, root, {"d": DIR, "d/e": DIR})
+        d, e = self.at(root, "d"), self.at(root, "d/e")
+        for path in (root, d, e):
+            backend.list_dir(path)
+            self.seed_file(backend, backend.join(path, "new"), b"n")
+
+        def names(path: str) -> set[str]:
+            return {entry.name for entry in backend.list_dir(path)}
+
+        backend.invalidate(d)
+        assert names(d) == {"e", "new"}
+        assert names(e) == {"new"}
+        backend.invalidate()
+        assert names(root) == {"d", "new"}
+        self.seed_file(backend, self.at(root, "newer"), b"n")
+        backend.invalidate("/")
+        assert names(root) == {"d", "new", "newer"}
+
+    # -- archive attributes ------------------------------------------------------------------
+
+    def test_archive_attributes_are_none_or_well_formed(self, backend: Backend) -> None:
+        archive_dir, max_bytes = backend.archive_dir, backend.archive_max_bytes
+        assert archive_dir is None or (
+            isinstance(archive_dir, str)
+            and archive_dir.startswith("/")
+            and posixpath.normpath(archive_dir) == archive_dir
+        ), archive_dir
+        assert max_bytes is None or (type(max_bytes) is int and max_bytes > 0), max_bytes
+
+    # -- pack ----------------------------------------------------------------------------------
+
+    def test_pack_writes_one_gzip_tar_of_the_selection_named_relative_to_the_parent(
+        self, backend: Backend, root: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        tree = {
+            "src": DIR,
+            "src/f": FILE(b"one"),
+            "src/d": DIR,
+            "src/d/g": FILE(b"two"),
+            "src/d/sub": DIR,
+            "src/d/sub/h": FILE(b"three"),
+            "src/d/empty": DIR,
+            "src/unselected": FILE(b"not packed"),
+        }
+        self.seed(backend, root, tree)
+        backend.pack(self.at(root, "src"), ["f", "d"], self.at(root, "a.tgz"))
+        data = self.archive_bytes(backend, root, "a.tgz")
+        assert self.observe(backend, root) == {**tree, "a.tgz": FILE(data)}, "packed entries changed"
+        members = archive_members(data)
+        names = [info.name for info, _ in members]
+        assert len(names) == len(set(names)), f"duplicate members: {names}"
+        assert {info.name: node for info, node in members} == {
+            "f": FILE(b"one"),
+            "d": DIR,
+            "d/g": FILE(b"two"),
+            "d/sub": DIR,
+            "d/sub/h": FILE(b"three"),
+            "d/empty": DIR,
+        }
+        for index, name in enumerate(names):
+            parent = posixpath.dirname(name)
+            if parent:
+                assert names.index(parent) < index, f"{parent} is stored after {name}"
+        for info, _ in members:
+            assert not info.name.startswith("/") and ".." not in info.name.split("/"), info.name
+            assert (info.uid, info.gid, info.uname, info.gname) == (0, 0, "", ""), info.name
+
+    def test_pack_records_permission_bits_and_mtimes(self, backend: Backend, root: str) -> None:
+        self.need(backend, Cap.ARCHIVE, Cap.STAT)
+        self.seed(
+            backend, root, {"src": DIR, "src/f": FILE(b"1"), "src/d": DIR, "src/d/g": FILE(b"2")}
+        )
+        backend.pack(self.at(root, "src"), ["f", "d"], self.at(root, "a.tgz"))
+        members = archive_members(self.archive_bytes(backend, root, "a.tgz"))
+        assert sorted(info.name for info, _ in members) == ["d", "d/g", "f"]
+        for info, _ in members:
+            entry = backend.stat(self.at(root, "src/" + info.name))
+            if entry.mode is not None:
+                assert info.mode == entry.mode, (info.name, oct(info.mode), oct(entry.mode))
+            if entry.mtime is not None:
+                assert abs(info.mtime - entry.mtime) < 1, (info.name, info.mtime, entry.mtime)
+
+    def test_pack_stores_symlinks_as_links_and_never_follows_them(
+        self, backend: Backend, root: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        tree = {
+            "src": DIR,
+            "src/outside": DIR,
+            "src/outside/secret": FILE(b"must not be packed"),
+            "src/d": DIR,
+            "src/d/f": FILE(b"1"),
+            "src/d/to-f": LINK("f"),
+            "src/d/to-outside": LINK("../outside"),
+            "src/d/abs": LINK(self.at(root, "src/outside/secret")),
+            "src/d/dangling": LINK("nowhere"),
+            "src/selected-link": LINK("outside"),
+        }
+        self.seed(backend, root, tree)
+        backend.pack(self.at(root, "src"), ["d", "selected-link"], self.at(root, "a.tgz"))
+        packed = archive_members(self.archive_bytes(backend, root, "a.tgz"))
+        assert {info.name: node for info, node in packed} == {
+            "d": DIR,
+            "d/f": FILE(b"1"),
+            "d/to-f": LINK("f"),
+            "d/to-outside": LINK("../outside"),
+            "d/abs": LINK(self.at(root, "src/outside/secret")),
+            "d/dangling": LINK("nowhere"),
+            "selected-link": LINK("outside"),
+        }
+        after = self.observe(backend, root)
+        assert after.pop("a.tgz")[0] == "file"
+        assert after == tree, "the packed entries changed"
+
+    def test_pack_follows_a_symlink_to_a_directory_at_parent(
+        self, backend: Backend, root: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        self.seed(backend, root, {"d": DIR, "d/x": FILE(b"1"), "to-d": LINK("d")})
+        backend.pack(self.at(root, "to-d"), ["x"], self.at(root, "a.tgz"))
+        packed = archive_members(self.archive_bytes(backend, root, "a.tgz"))
+        assert [(info.name, node) for info, node in packed] == [("x", FILE(b"1"))]
+
+    def test_pack_of_no_names_writes_an_archive_without_members(
+        self, backend: Backend, root: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        self.seed(backend, root, {"src": DIR, "src/f": FILE(b"1")})
+        backend.pack(self.at(root, "src"), [], self.at(root, "a.tgz"))
+        assert archive_members(self.archive_bytes(backend, root, "a.tgz")) == []
+        after = self.observe(backend, root)
+        assert after.pop("a.tgz")[0] == "file"
+        assert after == {"src": DIR, "src/f": FILE(b"1")}
+
+    @pytest.mark.parametrize(
+        "existing", [DIR, FILE(b"x"), LINK("missing")], ids=["dir", "file", "dangling-link"]
+    )
+    def test_pack_onto_an_existing_path_raises_already_exists_and_leaves_it_unchanged(
+        self, backend: Backend, root: str, existing: Node
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        self.seed(backend, root, {"src": DIR, "src/f": FILE(b"1"), "a.tgz": existing})
+        before = self.observe(backend, root)
+        with pytest.raises(AlreadyExists) as err:
+            backend.pack(self.at(root, "src"), ["f"], self.at(root, "a.tgz"))
+        assert err.value.path == self.at(root, "a.tgz")
+        assert self.observe(backend, root) == before
+
+    def test_pack_into_a_missing_directory_raises_not_found(
+        self, backend: Backend, root: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        self.seed(backend, root, {"src": DIR, "src/f": FILE(b"1")})
+        with pytest.raises(NotFound):
+            backend.pack(self.at(root, "src"), ["f"], self.at(root, "missing/a.tgz"))
+        assert self.observe(backend, root) == {"src": DIR, "src/f": FILE(b"1")}
+
+    def test_pack_of_a_missing_parent_raises_not_found_about_it(
+        self, backend: Backend, root: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        with pytest.raises(NotFound) as err:
+            backend.pack(self.at(root, "missing"), ["f"], self.at(root, "a.tgz"))
+        assert err.value.path == self.at(root, "missing")
+        assert self.observe(backend, root) == {}
+
+    def test_pack_with_a_missing_name_raises_not_found_about_it_and_leaves_no_archive(
+        self, backend: Backend, root: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        tree = {"src": DIR, "src/a": FILE(b"a"), "src/b": FILE(b"b")}
+        self.seed(backend, root, tree)
+        with pytest.raises(NotFound) as err:
+            backend.pack(self.at(root, "src"), ["a", "missing", "b"], self.at(root, "a.tgz"))
+        assert err.value.path == self.at(root, "src/missing")
+        assert self.observe(backend, root) == tree
+
+    def test_pack_of_a_file_as_parent_raises_not_a_directory(
+        self, backend: Backend, root: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        self.seed(backend, root, {"f": FILE(b"1")})
+        with pytest.raises(NotADirectory):
+            backend.pack(self.at(root, "f"), ["x"], self.at(root, "a.tgz"))
+        assert self.observe(backend, root) == {"f": FILE(b"1")}
+
+    # -- unpack --------------------------------------------------------------------------------
+
+    def test_unpack_extracts_into_a_new_directory_and_removes_the_archive(
+        self, backend: Backend, root: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        data = make_archive(
+            [("f", FILE(b"one")), ("d", DIR), ("d/g", FILE(b"two")), ("d/empty", DIR)]
+        )
+        self.seed(backend, root, {"a.tgz": FILE(data), "parent": DIR})
+        backend.unpack(self.at(root, "a.tgz"), self.at(root, "parent/dest"))
+        assert self.observe(backend, root) == {
+            "parent": DIR,
+            "parent/dest": DIR,
+            "parent/dest/f": FILE(b"one"),
+            "parent/dest/d": DIR,
+            "parent/dest/d/g": FILE(b"two"),
+            "parent/dest/d/empty": DIR,
+        }
+
+    def test_unpack_of_an_archive_without_members_creates_an_empty_directory(
+        self, backend: Backend, root: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        self.seed(backend, root, {"a.tgz": FILE(make_archive([]))})
+        backend.unpack(self.at(root, "a.tgz"), self.at(root, "dest"))
+        assert self.observe(backend, root) == {"dest": DIR}
+
+    def test_unpack_recreates_symlinks_with_their_link_text_unchanged(
+        self, backend: Backend, root: str
+    ) -> None:
+        # Absolute links and links leading out of dest are kept as they are
+        # (the "tar" filter, not the stricter "data" one).
+        self.need(backend, Cap.ARCHIVE)
+        self.need_symlinks()
+        absolute = self.at(root, "outside/target")
+        data = make_archive(
+            [
+                ("d", DIR),
+                ("d/f", FILE(b"1")),
+                ("d/rel", LINK("f")),
+                ("d/up", LINK("../../outside")),
+                ("abs", LINK(absolute)),
+                ("dangling", LINK("nowhere")),
+            ]
+        )
+        self.seed(backend, root, {"a.tgz": FILE(data), "outside": DIR})
+        backend.unpack(self.at(root, "a.tgz"), self.at(root, "dest"))
+        assert self.observe(backend, root) == {
+            "outside": DIR,
+            "dest": DIR,
+            "dest/d": DIR,
+            "dest/d/f": FILE(b"1"),
+            "dest/d/rel": LINK("f"),
+            "dest/d/up": LINK("../../outside"),
+            "dest/abs": LINK(absolute),
+            "dest/dangling": LINK("nowhere"),
+        }
+
+    def test_unpack_applies_the_recorded_mtimes_and_modes_without_special_or_group_other_write_bits(
+        self, backend: Backend, root: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE, Cap.STAT)
+        mtime = 1_234_567_890
+        members = [
+            ("d", DIR, 0o777),
+            ("d/private", DIR, 0o700),
+            ("d/setid", FILE(b"x"), 0o6777),
+            ("d/read-only", FILE(b"r"), 0o444),
+            ("d/shared", FILE(b"s"), 0o666),
+            ("d/plain", FILE(b"p"), 0o640),
+            ("sticky", DIR, 0o1777),
+        ]
+        self.seed(backend, root, {"a.tgz": FILE(make_archive(members, mtime=mtime))})
+        backend.unpack(self.at(root, "a.tgz"), self.at(root, "dest"))
+        expected = {
+            "d": 0o755,
+            "d/private": 0o700,
+            "d/setid": 0o755,
+            "d/read-only": 0o444,
+            "d/shared": 0o644,
+            "d/plain": 0o640,
+            "sticky": 0o755,
+        }
+        for rel, mode in expected.items():
+            entry = backend.stat(self.at(root, "dest/" + rel))
+            if entry.mode is not None:
+                assert entry.mode == mode, (rel, oct(entry.mode), oct(mode))
+            if entry.mtime is not None:
+                assert abs(entry.mtime - mtime) < 1, (rel, entry.mtime)
+
+    @pytest.mark.parametrize("escape", ["dot-dot", "absolute-name", "through-a-symlink"])
+    def test_unpack_refuses_a_member_that_would_land_outside_dest(
+        self, backend: Backend, root: str, escape: str
+    ) -> None:
+        # Each escape aims at root/escaped (an absolute member name too), so a
+        # backend that wrongly extracts it still writes nowhere outside root.
+        self.need(backend, Cap.ARCHIVE)
+        ok = ("ok", FILE(b"extracted first"))
+        if escape == "dot-dot":
+            members = [ok, ("../escaped", FILE(b"x"))]
+        elif escape == "absolute-name":
+            members = [ok, (self.at(root, "escaped"), FILE(b"x"))]
+        else:
+            self.need_symlinks()
+            members = [ok, ("esc", LINK(root)), ("esc/escaped", FILE(b"x"))]
+        self.seed(backend, root, {"a.tgz": FILE(make_archive(members))})
+        before = self.observe(backend, root)
+        with pytest.raises(OperationFailed):
+            backend.unpack(self.at(root, "a.tgz"), self.at(root, "dest"))
+        # dest is removed with what was extracted, and the archive is kept.
+        assert self.observe(backend, root) == before
+
+    @pytest.mark.parametrize(
+        "damage",
+        [
+            "not-gzip",
+            "gzip-but-not-tar",
+            "truncated",
+            "gzip-trailer-cut-off",
+            "content-changed-under-the-recorded-crc",
+            "bytes-after-the-gzip-member",
+            "hard-link-to-a-member-not-in-the-archive",
+        ],
+    )
+    def test_unpack_of_a_damaged_archive_raises_operation_failed_and_keeps_it(
+        self, backend: Backend, root: str, damage: str
+    ) -> None:
+        # The trailer and bytes-after cases leave every tar header intact, so
+        # only the end of the gzip stream shows the damage: tar reading stops
+        # at the end-of-archive block, before the trailer, unless it is read.
+        # pack stores a hard link only to a file it stored before it, so a
+        # link to a member that is not in the archive is not pack's either.
+        self.need(backend, Cap.ARCHIVE)
+        if damage == "not-gzip":
+            data = b"this is not a gzip-compressed tar\n" * 32
+        elif damage == "gzip-but-not-tar":
+            data = gzip.compress(b"plain text, not a tar archive\n" * 64)
+        elif damage == "truncated":
+            whole = make_archive(
+                [("a", FILE(incompressible(64 * 1024, 1))), ("b", FILE(incompressible(64 * 1024, 2)))]
+            )
+            data = whole[: len(whole) // 2]
+        elif damage == "hard-link-to-a-member-not-in-the-archive":
+            buffer = io.BytesIO()
+            with tarfile.open(
+                fileobj=buffer, mode="w:gz", compresslevel=6, format=tarfile.PAX_FORMAT
+            ) as tar:
+                ok = tarfile.TarInfo("ok")
+                ok.size, ok.mtime = 1, ARCHIVE_MTIME
+                tar.addfile(ok, io.BytesIO(b"1"))
+                link = tarfile.TarInfo("h")
+                link.type, link.linkname, link.mtime = tarfile.LNKTYPE, "missing", ARCHIVE_MTIME
+                tar.addfile(link)
+            data = buffer.getvalue()
+            # Harness check: a well-formed gzip tar; only the link is wrong.
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+                assert [m.name for m in tar.getmembers()] == ["ok", "h"]
+            gzip.decompress(data)
+        else:
+            whole = make_archive(
+                [("f", FILE(b"the original content\n" * 64)), ("g", FILE(b"second file\n"))]
+            )
+            if damage == "gzip-trailer-cut-off":
+                data = whole[:-8]  # every deflate byte, without the CRC-32 and size
+            elif damage == "bytes-after-the-gzip-member":
+                data = whole + b"not a gzip member\n"  # neither a gzip header nor zero padding
+            else:
+                plain = gzip.decompress(whole)
+                with tarfile.open(fileobj=io.BytesIO(plain)) as tar:
+                    offset = tar.getmember("f").offset_data
+                altered = bytearray(plain)
+                altered[offset] ^= 0x20  # "the original" -> "The original"
+                rewrapped = gzip.compress(bytes(altered), compresslevel=6, mtime=0)
+                data = rewrapped[:-8] + whole[-8:]  # the trailer recorded for the original
+                assert gzip.decompress(rewrapped) != plain and whole[-4:] == rewrapped[-4:]
+            # Harness check: reading the whole gzip stream does see the damage.
+            with pytest.raises((EOFError, gzip.BadGzipFile)):
+                gzip.decompress(data)
+        self.seed(backend, root, {"a.tgz": FILE(data)})
+        with pytest.raises(OperationFailed):
+            backend.unpack(self.at(root, "a.tgz"), self.at(root, "dest"))
+        assert self.observe(backend, root) == {"a.tgz": FILE(data)}
+
+    def test_unpack_of_a_missing_archive_raises_not_found_and_creates_nothing(
+        self, backend: Backend, root: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        with pytest.raises(NotFound):
+            backend.unpack(self.at(root, "missing.tgz"), self.at(root, "dest"))
+        assert self.observe(backend, root) == {}
+
+    @pytest.mark.parametrize(
+        "existing", [DIR, FILE(b"x"), LINK("missing")], ids=["dir", "file", "dangling-link"]
+    )
+    def test_unpack_onto_an_existing_path_raises_already_exists_and_keeps_the_archive(
+        self, backend: Backend, root: str, existing: Node
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        self.seed(
+            backend, root, {"a.tgz": FILE(make_archive([("f", FILE(b"1"))])), "dest": existing}
+        )
+        before = self.observe(backend, root)
+        with pytest.raises(AlreadyExists) as err:
+            backend.unpack(self.at(root, "a.tgz"), self.at(root, "dest"))
+        assert err.value.path == self.at(root, "dest")
+        assert self.observe(backend, root) == before
+
+    def test_unpack_under_a_missing_parent_raises_not_found_about_dest(
+        self, backend: Backend, root: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        self.seed(backend, root, {"a.tgz": FILE(make_archive([("f", FILE(b"1"))]))})
+        before = self.observe(backend, root)
+        with pytest.raises(NotFound) as err:
+            backend.unpack(self.at(root, "a.tgz"), self.at(root, "missing/dest"))
+        assert err.value.path == self.at(root, "missing/dest")
+        assert self.observe(backend, root) == before
+
+    # -- pack, then unpack ----------------------------------------------------------------------
+
+    def test_pack_then_unpack_reproduces_the_selection_with_its_modes_and_mtimes(
+        self, backend: Backend, root: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        tree = {
+            "src": DIR,
+            "src/f": FILE(b"one"),
+            "src/d": DIR,
+            "src/d/g": FILE(bytes(range(256)) * 64),
+            "src/d/empty": DIR,
+            "src/d/sub": DIR,
+            "src/d/sub/h": FILE(b""),
+            "src/unselected": FILE(b"stays behind"),
+        }
+        self.seed(backend, root, tree)
+        backend.pack(self.at(root, "src"), ["f", "d"], self.at(root, "a.tgz"))
+        backend.unpack(self.at(root, "a.tgz"), self.at(root, "out"))
+        selection = {
+            rel: node for rel, node in self.below(tree, "src").items() if rel != "unselected"
+        }
+        assert self.observe(backend, root) == {
+            **tree,
+            "out": DIR,
+            **{f"out/{rel}": node for rel, node in selection.items()},
+        }
+        if Cap.STAT not in backend.caps:
+            return
+        for rel in selection:
+            original = backend.stat(self.at(root, f"src/{rel}"))
+            copy = backend.stat(self.at(root, f"out/{rel}"))
+            if original.mode is not None and copy.mode is not None:
+                assert copy.mode == original.mode & 0o755, (rel, oct(copy.mode), oct(original.mode))
+            if original.mtime is not None and copy.mtime is not None:
+                assert abs(copy.mtime - original.mtime) < 1, (rel, copy.mtime, original.mtime)
+
+    def test_hostile_names_round_trip_through_pack_and_unpack(
+        self, backend: Backend, root: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        tree: dict[str, Node] = {"src": DIR, "src/-dir $(x)": DIR, "src/-dir $(x)/'q' *": FILE(b"in")}
+        tree.update({f"src/{name}": FILE(name.encode()) for name in HOSTILE_NAMES})
+        self.seed(backend, root, tree)
+        selection = self.below(tree, "src")
+        names = [rel for rel in selection if "/" not in rel]
+        backend.pack(self.at(root, "src"), names, self.at(root, "a.tgz"))
+        packed = archive_members(self.archive_bytes(backend, root, "a.tgz"))
+        assert {info.name: node for info, node in packed} == selection
+        backend.unpack(self.at(root, "a.tgz"), self.at(root, "out"))
+        assert self.observe(backend, root) == {
+            **tree,
+            "out": DIR,
+            **{f"out/{rel}": node for rel, node in selection.items()},
+        }
+
+    # -- merge -----------------------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "src", [FILE(b"f"), DIR, LINK("anywhere")], ids=["file", "dir", "symlink"]
+    )
+    def test_merge_to_a_free_path_renames(self, backend: Backend, root: str, src: Node) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        moved: dict[str, Node] = {"s": src}
+        if src == DIR:
+            moved.update({"s/x": FILE(b"1"), "s/sub": DIR, "s/sub/y": FILE(b"2")})
+        self.seed(backend, root, {**moved, "t": DIR})
+        backend.merge(self.at(root, "s"), self.at(root, "t/moved"))
+        assert self.observe(backend, root) == {
+            "t": DIR,
+            **{"t/moved" + rel[len("s") :]: node for rel, node in moved.items()},
+        }
+
+    def test_merge_of_directories_merges_entry_by_entry_and_removes_the_source(
+        self, backend: Backend, root: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        self.seed(
+            backend,
+            root,
+            {
+                "s": DIR,
+                "s/a": FILE(b"new a"),
+                "s/sub": DIR,
+                "s/sub/x": FILE(b"new x"),
+                "s/sub/deeper": DIR,
+                "s/sub/deeper/z": FILE(b"z"),
+                "s/fresh": DIR,
+                "s/fresh/y": FILE(b"y"),
+                "s/empty": DIR,
+                "t": DIR,
+                "t/a": FILE(b"old a"),
+                "t/keep": FILE(b"kept"),
+                "t/sub": DIR,
+                "t/sub/x": FILE(b"old x"),
+                "t/sub/w": FILE(b"kept w"),
+            },
+        )
+        backend.merge(self.at(root, "s"), self.at(root, "t"))
+        assert self.observe(backend, root) == {
+            "t": DIR,
+            "t/a": FILE(b"new a"),
+            "t/keep": FILE(b"kept"),
+            "t/sub": DIR,
+            "t/sub/x": FILE(b"new x"),
+            "t/sub/w": FILE(b"kept w"),
+            "t/sub/deeper": DIR,
+            "t/sub/deeper/z": FILE(b"z"),
+            "t/fresh": DIR,
+            "t/fresh/y": FILE(b"y"),
+            "t/empty": DIR,
+        }
+
+    def test_merge_replaces_a_non_directory_and_never_follows_a_symlink_at_the_destination(
+        self, backend: Backend, root: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        self.seed(
+            backend,
+            root,
+            {
+                "new": FILE(b"new"),
+                "old": FILE(b"old"),
+                "s": DIR,
+                "s/to-d": FILE(b"replaces the link"),
+                "s/link": LINK("new-target"),
+                "t": DIR,
+                "t/to-d": LINK("../d"),
+                "t/link": FILE(b"replaced by a link"),
+                "d": DIR,
+                "d/inside": FILE(b"untouched"),
+            },
+        )
+        backend.merge(self.at(root, "new"), self.at(root, "old"))
+        backend.merge(self.at(root, "s"), self.at(root, "t"))
+        assert self.observe(backend, root) == {
+            "old": FILE(b"new"),
+            "t": DIR,
+            "t/to-d": FILE(b"replaces the link"),
+            "t/link": LINK("new-target"),
+            "d": DIR,
+            "d/inside": FILE(b"untouched"),
+        }
+
+    def test_merge_keeps_the_destination_directory_with_its_own_mode(
+        self, backend: Backend, root: str
+    ) -> None:
+        # t is an empty directory, where a plain rename of s onto it would
+        # succeed and take s's mode. unpack gives the two different modes.
+        self.need(backend, Cap.ARCHIVE, Cap.STAT)
+        data = make_archive([("s", DIR, 0o750), ("s/f", FILE(b"1")), ("t", DIR, 0o700)])
+        self.seed(backend, root, {"a.tgz": FILE(data)})
+        backend.unpack(self.at(root, "a.tgz"), self.at(root, "stage"))
+        s, t = self.at(root, "stage/s"), self.at(root, "stage/t")
+        modes = (backend.stat(s).mode, backend.stat(t).mode)
+        backend.merge(s, t)
+        assert self.observe(backend, root) == {
+            "stage": DIR,
+            "stage/t": DIR,
+            "stage/t/f": FILE(b"1"),
+        }
+        if None not in modes:
+            assert modes == (0o750, 0o700), [oct(m or 0) for m in modes]
+            assert backend.stat(t).mode == 0o700
+
+    @pytest.mark.parametrize(
+        ("at_src", "at_dst", "error"),
+        [
+            (FILE(b"new"), DIR, IsADirectory),
+            (LINK("elsewhere"), DIR, IsADirectory),
+            (DIR, FILE(b"old"), NotADirectory),
+            (DIR, LINK("../../d"), NotADirectory),
+        ],
+        ids=["file-onto-dir", "symlink-onto-dir", "dir-onto-file", "dir-onto-symlink-to-dir"],
+    )
+    def test_merge_clash_raises_about_the_deepest_path_and_moves_nothing(
+        self, backend: Backend, root: str, at_src: Node, at_dst: Node, error: type[Exception]
+    ) -> None:
+        # Kinds are taken by lstat: a symlink is a non-directory at either end.
+        self.need(backend, Cap.ARCHIVE)
+        tree = {
+            "d": DIR,
+            "d/inside": FILE(b"untouched"),
+            "s": DIR,
+            "s/sub": DIR,
+            "s/sub/c": at_src,
+            "t": DIR,
+            "t/sub": DIR,
+            "t/sub/c": at_dst,
+        }
+        if at_src == DIR:
+            tree["s/sub/c/x"] = FILE(b"x")
+        if at_dst == DIR:
+            tree["t/sub/c/y"] = FILE(b"y")
+        self.seed(backend, root, tree)
+        with pytest.raises(error) as err:
+            backend.merge(self.at(root, "s"), self.at(root, "t"))
+        assert err.value.path == self.at(root, "t/sub/c")  # type: ignore[attr-defined]
+        assert self.observe(backend, root) == tree
+
+    def test_merge_of_a_file_onto_a_directory_raises_is_a_directory(
+        self, backend: Backend, root: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        tree = {"f": FILE(b"1"), "d": DIR, "d/x": FILE(b"x")}
+        self.seed(backend, root, tree)
+        with pytest.raises(IsADirectory) as err:
+            backend.merge(self.at(root, "f"), self.at(root, "d"))
+        assert err.value.path == self.at(root, "d")
+        assert self.observe(backend, root) == tree
+
+    def test_merge_stops_at_the_first_error_and_loses_nothing(
+        self, backend: Backend, root: str
+    ) -> None:
+        # Entries merge in no particular order, so each one is either still in
+        # s or already in t, never both, never neither.
+        self.need(backend, Cap.ARCHIVE)
+        tree = {
+            "s": DIR,
+            "s/a": FILE(b"a"),
+            "s/b": DIR,
+            "s/b/f": FILE(b"bf"),
+            "s/c": FILE(b"c"),
+            "s/clash": DIR,
+            "s/clash/x": FILE(b"x"),
+            "t": DIR,
+            "t/clash": FILE(b"old"),
+        }
+        self.seed(backend, root, tree)
+        with pytest.raises(NotADirectory) as err:
+            backend.merge(self.at(root, "s"), self.at(root, "t"))
+        assert err.value.path == self.at(root, "t/clash")
+        after = self.observe(backend, root)
+        for rel in ("s", "s/clash", "s/clash/x", "t", "t/clash"):
+            assert after.get(rel) == tree[rel], rel
+        movable = ("a", "b", "b/f", "c")
+        for rel in movable:
+            in_s, in_t = after.get(f"s/{rel}"), after.get(f"t/{rel}")
+            assert (in_s is None) != (in_t is None), f"{rel}: in s {in_s}, in t {in_t}"
+            assert (in_s or in_t) == tree[f"s/{rel}"], rel
+        allowed = {"s", "s/clash", "s/clash/x", "t", "t/clash"}
+        allowed |= {f"{side}/{rel}" for side in "st" for rel in movable}
+        assert set(after) <= allowed, sorted(set(after) - allowed)
+
+    @pytest.mark.parametrize("dst", ["s", "s/inside", "s/sub/deeper"])
+    def test_merge_into_itself_or_its_own_subtree_raises_before_anything_moves(
+        self, backend: Backend, root: str, dst: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        tree = {"s": DIR, "s/sub": DIR, "s/f": FILE(b"1")}
+        self.seed(backend, root, tree)
+        with pytest.raises(OperationFailed):
+            backend.merge(self.at(root, "s"), self.at(root, dst))
+        assert self.observe(backend, root) == tree
+
+    def test_merge_to_a_sibling_sharing_a_name_prefix_is_not_a_subtree_merge(
+        self, backend: Backend, root: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        self.seed(backend, root, {"s": DIR, "s/f": FILE(b"1")})
+        backend.merge(self.at(root, "s"), self.at(root, "sb"))
+        assert self.observe(backend, root) == {"sb": DIR, "sb/f": FILE(b"1")}
+
+    def test_merge_of_a_missing_source_raises_not_found(self, backend: Backend, root: str) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        self.seed(backend, root, {"t": DIR})
+        with pytest.raises(NotFound):
+            backend.merge(self.at(root, "missing"), self.at(root, "t"))
+        assert self.observe(backend, root) == {"t": DIR}
+
+    def test_merge_to_a_missing_parent_raises_not_found_and_keeps_the_source(
+        self, backend: Backend, root: str
+    ) -> None:
+        self.need(backend, Cap.ARCHIVE)
+        tree = {"s": DIR, "s/f": FILE(b"1")}
+        self.seed(backend, root, tree)
+        with pytest.raises(NotFound):
+            backend.merge(self.at(root, "s"), self.at(root, "missing/t"))
+        assert self.observe(backend, root) == tree
+
     # -- hostile names --------------------------------------------------------------------
 
     @pytest.mark.parametrize("name", HOSTILE_NAMES, ids=repr)
     def test_hostile_names_round_trip_through_every_operation(
         self, backend: Backend, root: str, local_tmp: Path, name: str
     ) -> None:
-        self.need(backend, *Cap)
+        # The caps this test calls, named one by one: ``*Cap`` would also ask
+        # for ARCHIVE and skip the test on every backend without it.
+        self.need(
+            backend,
+            Cap.LIST,
+            Cap.STAT,
+            Cap.MKDIR,
+            Cap.DELETE,
+            Cap.RENAME,
+            Cap.COPY_WITHIN,
+            Cap.UPLOAD,
+            Cap.DOWNLOAD,
+        )
         src = self.local_file(local_tmp, "src", b"payload")
         folder = self.at(root, name)
         backend.mkdir(folder)
@@ -1040,15 +1935,26 @@ class BackendContract:
     ) -> None:
         if cap in backend.caps:
             pytest.skip(f"{backend.label} has {cap.name}")
-        self.seed(backend, root, {"f": FILE(b"data"), "d": DIR, "d/x": FILE(b"x")})
+        archive = make_archive([("x", FILE(b"x"))])
+        self.seed(
+            backend,
+            root,
+            {"f": FILE(b"data"), "d": DIR, "d/x": FILE(b"x"), "a.tgz": FILE(archive)},
+        )
         up = self.local_file(local_tmp, "up", b"up")
         got = str(local_tmp / "got")
         f, d, missing, new = (self.at(root, rel) for rel in ("f", "d", "missing", "new"))
+        tgz = self.at(root, "a.tgz")
         calls: dict[Cap, list[Callable[[], object]]] = {
             Cap.LIST: [lambda: backend.list_dir(root), lambda: backend.walk(root)],
             Cap.STAT: [lambda: backend.stat(f), lambda: backend.exists(f)],
             Cap.MKDIR: [lambda: backend.mkdir(new)],
-            Cap.DELETE: [lambda: backend.delete(f), lambda: backend.delete(d, recursive=True)],
+            Cap.DELETE: [
+                lambda: backend.delete(f),
+                lambda: backend.delete(d, recursive=True),
+                lambda: backend.delete_many([f, d], recursive=True),
+                lambda: backend.delete_many([]),
+            ],
             Cap.RENAME: [lambda: backend.rename(f, new)],
             Cap.COPY_WITHIN: [
                 lambda: backend.copy_within(f, new),
@@ -1059,13 +1965,28 @@ class BackendContract:
                 lambda: backend.upload(up, f, overwrite=True),
             ],
             Cap.DOWNLOAD: [lambda: backend.download(f, got)],
+            Cap.ARCHIVE: [
+                lambda: backend.pack(root, ["f", "d"], new),
+                lambda: backend.unpack(tgz, new),
+                lambda: backend.merge(d, new),
+                lambda: backend.merge(f, self.at(root, "d/x")),
+            ],
         }
         # Unsupported comes before any other check, even for a path that would fail anyway.
         calls[Cap.LIST].append(lambda: backend.list_dir(missing))
         calls[Cap.STAT].append(lambda: backend.exists(missing))
         calls[Cap.DELETE].append(lambda: backend.delete(missing))
+        calls[Cap.DELETE].append(lambda: backend.delete_many([missing]))
         calls[Cap.RENAME].append(lambda: backend.rename(missing, new))
         calls[Cap.DOWNLOAD].append(lambda: backend.download(missing, got))
+        calls[Cap.ARCHIVE] += [
+            lambda: backend.pack(missing, ["x"], new),
+            lambda: backend.pack(root, ["f"], tgz),
+            lambda: backend.unpack(missing, new),
+            lambda: backend.unpack(tgz, d),
+            lambda: backend.merge(missing, new),
+            lambda: backend.merge(d, self.at(root, "d/inside")),
+        ]
         before = self.observe(backend, root)
         for call in calls[cap]:
             with pytest.raises(Unsupported):

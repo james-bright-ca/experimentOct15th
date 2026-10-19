@@ -1,5 +1,6 @@
-"""F5 copy, F6 move, Shift-F6 rename, F7 mkdir and F8 delete, driven with the
-keyboard against a stub engine on LocalBackend over tmp_path.
+"""F5 copy, F6 move, rename (Ctrl-N, or Shift-F6 where the terminal can send
+it), F7 mkdir and F8 delete, driven with the keyboard against a stub engine
+on LocalBackend over tmp_path.
 
 Every dialog here is answered with the keyboard (Enter in the input, or the
 dialog's own keys); the buttons are covered in test_input_dialog_buttons.py.
@@ -79,7 +80,8 @@ async def test_f6_moves_the_cursor_file_to_the_other_panel(
         assert engine.names() == ["move"]
 
 
-@pytest.mark.parametrize("key", ["shift+f6", "ctrl+n", "f18"], ids=["Shift-F6", "Ctrl-N", "F18"])
+# F18 is not a rename key: Textual 8.2.8 can never produce it (see test_terminal_keys.py).
+@pytest.mark.parametrize("key", ["shift+f6", "ctrl+n"], ids=["Shift-F6", "Ctrl-N"])
 async def test_rename_dialog_is_prefilled_with_the_name_and_renames_in_place(
     tree: Tree, local: RecordingLocal, engine: StubEngine, key: str
 ) -> None:

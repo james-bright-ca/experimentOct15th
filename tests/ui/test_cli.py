@@ -30,6 +30,48 @@ def test_python_m_twinfm_help_exits_0_and_lists_every_flag() -> None:
     assert missing == [], f"--help does not list {missing}:\n{result.stdout}"
 
 
+def _help_of(argv0: list[str]) -> str:
+    """``argv0 --help`` as one line of words: argparse wraps to the terminal
+    width, so the wording is checked with whitespace collapsed."""
+    env = {**os.environ, "COLUMNS": "100", "NO_COLOR": "1"}
+    result = subprocess.run(
+        [*argv0, "--help"],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=60,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    return " ".join(result.stdout.split())
+
+
+def _console_script() -> list[str]:
+    """The installed ``twinfm`` command next to this interpreter (.venv/bin/twinfm)."""
+    script = Path(sys.executable).with_name("twinfm")
+    assert script.is_file(), f"no twinfm console script next to {sys.executable}; is the project installed?"
+    return [str(script)]
+
+
+@pytest.mark.parametrize(
+    "argv0", [lambda: [sys.executable, "-m", "twinfm"], _console_script], ids=["python-m-twinfm", "twinfm-script"]
+)
+def test_help_says_exec_mode_is_on_by_default_and_no_btty_exec_turns_it_off(argv0) -> None:  # type: ignore[no-untyped-def]
+    """[D1] exec mode is the default and --no-btty-exec is the opt-out."""
+    text = _help_of(argv0())
+    assert "exec mode, on by default" in text, text
+    assert "--no-btty-exec turns it off" in text, text
+    for flag in FLAGS:
+        assert flag in text, f"--help does not list {flag}: {text}"
+
+
+def test_help_does_not_call_exec_mode_off_by_default() -> None:
+    """The first iteration's help said exec was opt-in; nothing may say so now."""
+    text = _help_of([sys.executable, "-m", "twinfm"]).lower()
+    for stale in ("off by default", "disabled by default", "transfer-only by default", "default: off"):
+        assert stale not in text, f"--help still says {stale!r}: {text}"
+
+
 def test_version_exits_0_and_names_the_program() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "twinfm", "--version"],

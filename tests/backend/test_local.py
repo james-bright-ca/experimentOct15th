@@ -1,16 +1,20 @@
 """LocalBackend: the shared contract on tmp_path, plus local-only behaviour.
 
 The local-only cases are symlinks, the EXDEV fallback, permissions, the
-mapping of raw OSErrors, atomic writes, special files and the registry's
-local locations.
+mapping of raw OSErrors, atomic writes, special files, the registry's local
+locations, and the archive cases the contract cannot observe through its hooks.
 """
 
 from __future__ import annotations
 
 import errno
+import gzip
+import io
 import os
 import shutil
+import socket
 import stat
+import tarfile
 import threading
 import unicodedata
 from collections.abc import Callable, Iterator
@@ -1033,3 +1037,577 @@ def test_btty_locations_with_default_settings_resolve_against_the_workspaces_roo
     stand_in = MemoryBackend(label="btty stand-in")
     monkeypatch.setitem(REGISTRY, "btty", lambda settings: stand_in)
     assert parse_location(spec, Settings()) == (stand_in, expected)
+
+
+# -- archives: what the shared contract cannot observe --------------------------------------
+#
+# TestLocalBackendContract runs the archive contract through the hooks only. These
+# cases need the local filesystem itself: fifos and sockets, hard links, real
+# permission bits, crafted tar members and gzip streams, EXDEV, symlinks in the
+# destination path, and LocalBackend's own temporaries. The specification is
+# Backend.pack, Backend.unpack and Backend.merge in twinfm.backend.base.
+
+ARCHIVE_MTIME = 1_000_000_000
+
+TarMember = tuple[tarfile.TarInfo, bytes | None]
+
+
+def tar_members(archive: Path) -> dict[str, tarfile.TarInfo]:
+    """Every member of the gzip tar at ``archive``, of any type, by name."""
+    data = archive.read_bytes()
+    assert data[:2] == b"\x1f\x8b", f"not gzip-compressed: {data[:16]!r}"
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+        members = tar.getmembers()
+    names = [info.name for info in members]
+    assert len(names) == len(set(names)), f"duplicate members: {names}"
+    return {info.name: info for info in members}
+
+
+def member(
+    name: str,
+    kind: bytes = tarfile.REGTYPE,
+    data: bytes = b"",
+    *,
+    linkname: str = "",
+    mode: int | None = None,
+    uid: int = 0,
+    gid: int = 0,
+    uname: str = "",
+    gname: str = "",
+) -> TarMember:
+    """One crafted tar member: a file holding ``data``, or a directory, symlink or
+    hard link (``kind``). Mode defaults to 0o644 / 0o755 / 0o777."""
+    info = tarfile.TarInfo(name)
+    info.type = kind
+    info.mtime = ARCHIVE_MTIME
+    info.linkname = linkname
+    info.uid, info.gid, info.uname, info.gname = uid, gid, uname, gname
+    content = None
+    if kind == tarfile.REGTYPE:
+        info.size, content, default = len(data), data, 0o644
+    elif kind == tarfile.DIRTYPE:
+        default = 0o755
+    else:
+        default = 0o777
+    info.mode = default if mode is None else mode
+    return info, content
+
+
+def tar_bytes(*members: TarMember) -> bytes:
+    """An uncompressed PAX tar holding ``members`` in the order given."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        for info, content in members:
+            tar.addfile(info, None if content is None else io.BytesIO(content))
+    return buffer.getvalue()
+
+
+def gzip_tar(*members: TarMember) -> bytes:
+    """``members`` in pack's format: a gzip-compressed (level 6) PAX tar."""
+    return gzip.compress(tar_bytes(*members), compresslevel=6, mtime=0)
+
+
+@pytest.fixture
+def victim(root: Path) -> Path:
+    """root/outside/victim: a file outside every dest, which no archive may change."""
+    (root / "outside").mkdir()
+    path = root / "outside" / "victim"
+    path.write_bytes(b"precious")
+    path.chmod(0o600)
+    os.utime(path, (ARCHIVE_MTIME, ARCHIVE_MTIME))
+    return path
+
+
+def _identity(path: Path) -> tuple[bytes, int, int, int]:
+    st = os.stat(path)
+    return path.read_bytes(), stat.S_IMODE(st.st_mode), st.st_mtime_ns, st.st_nlink
+
+
+# -- pack ------------------------------------------------------------------------------------
+
+
+def test_pack_leaves_out_fifos_and_sockets_whether_selected_or_inside_a_selected_directory(
+    backend: LocalBackend, root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = root / "src"
+    (src / "d").mkdir(parents=True)
+    (src / "f").write_bytes(b"file")
+    (src / "d" / "g").write_bytes(b"nested")
+    os.symlink("f", src / "link")
+    os.mkfifo(src / "fifo")
+    os.mkfifo(src / "d" / "fifo")
+    archive = tmp_path / "a.tgz"
+    monkeypatch.chdir(src)  # an AF_UNIX address is short, so bind relative names
+    with socket.socket(socket.AF_UNIX) as top, socket.socket(socket.AF_UNIX) as nested:
+        top.bind("sock")
+        nested.bind("d/sock")
+        # A fifo without a writer blocks whoever opens it, so pack must not hang.
+        outcome = _finishes(
+            lambda: backend.pack(str(src), ["f", "d", "link", "fifo", "sock"], str(archive))
+        )
+    assert outcome is None, f"pack raised {outcome!r}"
+    members = tar_members(archive)
+    assert {name: (info.type, info.linkname) for name, info in members.items()} == {
+        "f": (tarfile.REGTYPE, ""),
+        "d": (tarfile.DIRTYPE, ""),
+        "d/g": (tarfile.REGTYPE, ""),
+        "link": (tarfile.SYMTYPE, "f"),
+    }
+    assert sorted(os.listdir(src)) == ["d", "f", "fifo", "link", "sock"]
+    assert sorted(os.listdir(src / "d")) == ["fifo", "g", "sock"]
+
+
+def test_pack_stores_uid_and_gid_0_and_no_owner_names_on_every_member_type(
+    backend: LocalBackend, root: Path, tmp_path: Path
+) -> None:
+    # A file, a directory, a symlink and a second hard link to the file: none
+    # carries an owner, not in the ustar fields and not in a PAX header.
+    src = root / "src"
+    (src / "d").mkdir(parents=True)
+    (src / "f").write_bytes(b"1")
+    os.link(src / "f", src / "d" / "hard")
+    os.symlink("f", src / "link")
+    archive = tmp_path / "a.tgz"
+    backend.pack(str(src), ["f", "d", "link"], str(archive))
+    members = tar_members(archive)
+    assert sorted(members) == ["d", "d/hard", "f", "link"]
+    for name, info in members.items():
+        assert (info.uid, info.gid, info.uname, info.gname) == (0, 0, "", ""), name
+        owner_headers = {"uid", "gid", "uname", "gname"} & set(info.pax_headers)
+        assert not owner_headers, (name, info.pax_headers)
+
+
+def test_pack_of_a_directory_that_is_the_current_directory_still_includes_it(
+    backend: LocalBackend, root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (root / "d").mkdir()
+    (root / "d" / "g").write_bytes(b"in the cwd")
+    monkeypatch.chdir(root / "d")
+    archive = tmp_path / "a.tgz"
+    backend.pack(str(root), ["d"], str(archive))
+    assert sorted(tar_members(archive)) == ["d", "d/g"]
+
+
+@needs_non_root
+def test_pack_that_cannot_read_a_file_raises_permission_denied_and_leaves_no_archive(
+    backend: LocalBackend, root: Path, tmp_path: Path, locked: Callable[[Path, int], None]
+) -> None:
+    src = root / "src"
+    (src / "d").mkdir(parents=True)
+    (src / "ok").write_bytes(b"ok")
+    (src / "d" / "secret").write_bytes(b"secret")
+    locked(src / "d" / "secret", 0)
+    archive = tmp_path / "a.tgz"
+    with pytest.raises(PermissionDenied):
+        backend.pack(str(src), ["ok", "d"], str(archive))
+    assert not os.path.lexists(archive)
+    assert sorted(os.listdir(tmp_path)) == ["root"]
+    assert sorted(os.listdir(src)) == ["d", "ok"]
+    assert leftovers(tmp_path) == []
+
+
+# -- unpack ----------------------------------------------------------------------------------
+
+
+def test_pack_then_unpack_reproduces_the_tree_byte_for_byte_with_exact_mtimes_and_safe_modes(
+    backend: LocalBackend, root: Path, tmp_path: Path
+) -> None:
+    src = root / "src"
+    (src / "d" / "deep").mkdir(parents=True)
+    files = {
+        "f": (b"top level", 0o600),
+        "d/setuid": (b"#!/bin/sh\n", 0o4755),
+        "d/shared": (b"group and other may write", 0o666),
+        "d/empty": (b"", 0o644),
+        "d/deep/blob": (bytes(range(256)) * 1024, 0o640),
+    }
+    for rel, (data, mode) in files.items():
+        (src / rel).write_bytes(data)
+        os.chmod(src / rel, mode)
+    dirs = {"d": 0o1777, "d/deep": 0o2775}  # sticky; setgid with group write
+    for rel, mode in dirs.items():
+        os.chmod(src / rel, mode)
+    modes = {**{rel: mode for rel, (_, mode) in files.items()}, **dirs}
+    mtimes = {rel: 1_100_000_000 + 1_000 * i for i, rel in enumerate(sorted(modes))}
+    for rel, mtime in mtimes.items():
+        os.utime(src / rel, (mtime, mtime))
+    on_disk = {rel: stat.S_IMODE(os.lstat(src / rel).st_mode) for rel in modes}
+    assert on_disk == modes, "the test could not set up its modes"
+
+    archive = tmp_path / "a.tgz"
+    backend.pack(str(src), ["f", "d"], str(archive))
+    recorded = tar_members(archive)
+    assert {rel: recorded[rel].mode for rel in modes} == modes, "pack records the modes as they are"
+    out = root / "out"
+    backend.unpack(str(archive), str(out))
+
+    assert not os.path.lexists(archive)
+    assert local_tree(str(out)) == local_tree(str(src))
+    assert {rel: stat.S_IMODE(os.lstat(out / rel).st_mode) for rel in modes} == {
+        "f": 0o600,
+        "d/setuid": 0o755,
+        "d/shared": 0o644,
+        "d/empty": 0o644,
+        "d/deep/blob": 0o640,
+        "d": 0o755,
+        "d/deep": 0o755,
+    }
+    assert {rel: os.lstat(out / rel).st_mtime_ns for rel in modes} == {
+        rel: mtime * 1_000_000_000 for rel, mtime in mtimes.items()
+    }
+    assert leftovers(tmp_path) == []
+
+
+def test_hard_links_inside_the_selection_survive_pack_and_unpack(
+    backend: LocalBackend, root: Path, tmp_path: Path
+) -> None:
+    src = root / "src"
+    (src / "d").mkdir(parents=True)
+    (src / "a").write_bytes(b"one inode")
+    os.link(src / "a", src / "d" / "b")
+    os.link(src / "a", src / "d" / "c")
+    archive = tmp_path / "a.tgz"
+    backend.pack(str(src), ["a", "d"], str(archive))
+    backend.unpack(str(archive), str(root / "out"))
+    assert local_tree(str(root / "out")) == {
+        "a": FILE(b"one inode"),
+        "d": DIR,
+        "d/b": FILE(b"one inode"),
+        "d/c": FILE(b"one inode"),
+    }
+    assert not os.path.lexists(archive)
+
+
+# Each escape is aimed at root/x or at root/outside/victim, so a backend that
+# wrongly lets it through still writes nowhere outside the test's directory.
+UNSAFE_MEMBERS: dict[str, Callable[[Path], list[TarMember]]] = {
+    "absolute-name": lambda victim: [member("/x", data=b"x")],
+    "dot-dot": lambda victim: [member("../x", data=b"x")],
+    "dot-dot-below-a-directory": lambda victim: [
+        member("a", tarfile.DIRTYPE),
+        member("a/../../x", data=b"x"),
+    ],
+    "under-a-symlink-leading-out": lambda victim: [
+        member("esc", tarfile.SYMTYPE, linkname=".."),
+        member("esc/x", data=b"x"),
+    ],
+    "hard-link-to-an-absolute-path": lambda victim: [
+        member("h", tarfile.LNKTYPE, linkname=str(victim)),
+        member("h", data=b"overwritten"),
+    ],
+    "hard-link-through-dot-dot": lambda victim: [
+        member("h", tarfile.LNKTYPE, linkname="../outside/victim"),
+        member("h", data=b"overwritten"),
+    ],
+    "hard-link-through-a-symlink-leading-out": lambda victim: [
+        member("esc", tarfile.SYMTYPE, linkname=str(victim.parent)),
+        member("h", tarfile.LNKTYPE, linkname="esc/victim"),
+        member("h", data=b"overwritten"),
+    ],
+}
+
+
+@pytest.mark.parametrize("unsafe", list(UNSAFE_MEMBERS))
+def test_unpack_refuses_a_member_that_escapes_dest_and_keeps_the_archive(
+    backend: LocalBackend, root: Path, victim: Path, unsafe: str
+) -> None:
+    archive = root / "a.tgz"
+    archive.write_bytes(
+        gzip_tar(member("ok", data=b"extracted first"), *UNSAFE_MEMBERS[unsafe](victim))
+    )
+    before = local_tree(str(root))
+    victim_before = _identity(victim)
+    with pytest.raises(OperationFailed):
+        backend.unpack(str(archive), str(root / "dest"))
+    assert _identity(victim) == victim_before
+    assert local_tree(str(root)) == before  # no dest, the archive kept, nothing new
+    assert leftovers(root.parent) == []
+
+
+def test_unpack_of_a_hard_link_to_a_member_not_in_the_archive_raises_operation_failed(
+    backend: LocalBackend, root: Path
+) -> None:
+    # pack stores a hard link only to a file it stored before it, so this is
+    # not an archive pack could have written: OperationFailed, no dest, and the
+    # archive kept.
+    archive = root / "a.tgz"
+    archive.write_bytes(
+        gzip_tar(member("ok", data=b"1"), member("h", tarfile.LNKTYPE, linkname="missing"))
+    )
+    before = local_tree(str(root))
+    with pytest.raises(OperationFailed):
+        backend.unpack(str(archive), str(root / "dest"))
+    assert local_tree(str(root)) == before
+
+
+def _damaged_archive(damage: str) -> bytes:
+    plain = tar_bytes(
+        member("f", data=b"the original content\n" * 64), member("g", data=b"second file\n")
+    )
+    whole = gzip.compress(plain, compresslevel=6, mtime=0)
+    if damage == "plain-tar":
+        return plain
+    if damage == "content-changed-under-the-original-crc":
+        # As if bytes changed on the way: a valid deflate stream whose content
+        # differs from what its CRC-32 trailer records.
+        with tarfile.open(fileobj=io.BytesIO(plain)) as tar:
+            offset = tar.getmember("f").offset_data
+        altered = bytearray(plain)
+        altered[offset] ^= 0x20  # "the" -> "The"
+        rewrapped = gzip.compress(bytes(altered), compresslevel=6, mtime=0)
+        return rewrapped[:-8] + whole[-8:-4] + rewrapped[-4:]
+    if damage == "size-changed-in-the-trailer":
+        # The CRC-32 still matches; only the recorded length is wrong.
+        return whole[:-4] + (len(plain) + 512).to_bytes(4, "little")
+    if damage == "non-gzip-bytes-after-the-gzip-member":
+        # The whole gzip member intact, then bytes that do not start another.
+        return whole + b"not another gzip member\n"
+    assert damage == "trailer-cut-off"
+    return whole[:-8]  # every deflate byte, without the CRC-32 and size
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "plain-tar",
+        "content-changed-under-the-original-crc",
+        "trailer-cut-off",
+        "size-changed-in-the-trailer",
+        "non-gzip-bytes-after-the-gzip-member",
+    ],
+)
+def test_unpack_of_an_archive_pack_could_not_have_written_raises_operation_failed(
+    backend: LocalBackend, root: Path, damage: str
+) -> None:
+    data = _damaged_archive(damage)
+    archive = root / "a.tgz"
+    archive.write_bytes(data)
+    dest = root / "dest"
+    try:
+        backend.unpack(str(archive), str(dest))
+    except OperationFailed:
+        pass
+    else:
+        extracted = local_tree(str(dest))
+        f = extracted.get("f", ("missing", None))[1]
+        pytest.fail(
+            f"unpack accepted the damaged archive ({damage}) and removed it; "
+            f"it extracted {sorted(extracted)}, with f beginning {f[:24] if f else f!r}"
+        )
+    assert local_tree(str(root)) == {"a.tgz": FILE(data)}
+    assert leftovers(root) == []
+
+
+def test_unpack_never_restores_ownership_even_when_run_as_root(
+    backend: LocalBackend, root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # tarfile changes owners only when the effective uid is 0. The test pretends
+    # to be root and records chown calls instead of making them.
+    calls: list[tuple[str, int, int]] = []
+
+    def record(path: object, uid: int, gid: int, *args: object, **kwargs: object) -> None:
+        calls.append((os.fspath(path), uid, gid))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(os, "chown", record)
+    monkeypatch.setattr(os, "lchown", record)
+    owner = {"uid": 1234, "gid": 5678, "uname": "root", "gname": "wheel"}
+    data = gzip_tar(
+        member("d", tarfile.DIRTYPE, **owner),
+        member("d/f", data=b"1", **owner),
+        member("d/link", tarfile.SYMTYPE, linkname="f", **owner),
+        member("d/hard", tarfile.LNKTYPE, linkname="d/f", **owner),
+    )
+    # Harness check: under this pretence, tarfile on its own restores owners.
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+        tar.extractall(tmp_path / "trusted", filter="fully_trusted")
+    assert any((uid, gid) != (-1, -1) for _, uid, gid in calls), calls
+    calls.clear()
+
+    archive = root / "a.tgz"
+    archive.write_bytes(data)
+    backend.unpack(str(archive), str(root / "dest"))
+    assert local_tree(str(root / "dest")) == {
+        "d": DIR,
+        "d/f": FILE(b"1"),
+        "d/link": LINK("f"),
+        "d/hard": FILE(b"1"),
+    }
+    restored = [(path, uid, gid) for path, uid, gid in calls if (uid, gid) != (-1, -1)]
+    assert restored == []
+
+
+# -- merge -----------------------------------------------------------------------------------
+
+
+def test_merge_across_filesystems_raises_operation_failed_and_copies_nothing(
+    backend: LocalBackend, root: Path, cross_device: list[tuple[str, str]]
+) -> None:
+    # merge only renames: EXDEV is an error, never a reason to copy.
+    (root / "f").write_bytes(b"file")
+    (root / "s" / "sub").mkdir(parents=True)
+    (root / "s" / "sub" / "x").write_bytes(b"x")
+    (root / "t" / "sub").mkdir(parents=True)
+    (root / "t" / "sub" / "w").write_bytes(b"w")
+    before = local_tree(str(root))
+    with pytest.raises(OperationFailed):
+        backend.merge(str(root / "f"), str(root / "t" / "f"))
+    with pytest.raises(OperationFailed):
+        backend.merge(str(root / "s"), str(root / "t"))
+    assert local_tree(str(root)) == before
+    assert len(cross_device) == 2
+    assert leftovers(root) == []
+
+
+def test_merge_into_a_target_reached_through_a_symlink_merges_into_the_real_directory(
+    backend: LocalBackend, root: Path
+) -> None:
+    # The orchestrator stages inside the target and merges each item into
+    # target/<name>; here the target is spelt through a symlink to it.
+    (root / "t" / "sub").mkdir(parents=True)
+    (root / "t" / "sub" / "w").write_bytes(b"kept")
+    os.symlink("t", root / "to-t")
+    stage = root / "to-t" / ".stage"
+    (stage / "sub").mkdir(parents=True)
+    (stage / "sub" / "x").write_bytes(b"new")
+    (stage / "fresh").mkdir()
+    (stage / "fresh" / "y").write_bytes(b"y")
+    (stage / "file").write_bytes(b"file")
+    for name in ("sub", "fresh", "file"):
+        backend.merge(str(stage / name), str(root / "to-t" / name))
+    assert local_tree(str(root)) == {
+        "to-t": LINK("t"),
+        "t": DIR,
+        "t/.stage": DIR,
+        "t/sub": DIR,
+        "t/sub/w": FILE(b"kept"),
+        "t/sub/x": FILE(b"new"),
+        "t/fresh": DIR,
+        "t/fresh/y": FILE(b"y"),
+        "t/file": FILE(b"file"),
+    }
+    assert leftovers(root) == []
+
+
+def test_merge_of_a_directory_onto_a_symlink_to_a_directory_raises_and_follows_nothing(
+    backend: LocalBackend, root: Path
+) -> None:
+    (root / "t").mkdir()
+    (root / "t" / "inside").write_bytes(b"untouched")
+    os.symlink("t", root / "to-t")
+    (root / "s").mkdir()
+    (root / "s" / "x").write_bytes(b"x")
+    before = local_tree(str(root))
+    with pytest.raises(NotADirectory) as err:
+        backend.merge(str(root / "s"), str(root / "to-t"))
+    assert err.value.path == str(root / "to-t")
+    assert local_tree(str(root)) == before
+
+
+def test_merge_of_a_staging_directory_inside_the_target_into_the_target(
+    backend: LocalBackend, root: Path
+) -> None:
+    # src below dst is not a merge into itself: only dst at or below src is.
+    t = root / "t"
+    (t / "sub").mkdir(parents=True)
+    (t / "a").write_bytes(b"old a")
+    (t / "keep").write_bytes(b"kept")
+    (t / "sub" / "w").write_bytes(b"kept w")
+    stage = t / ".twinfm-stage"
+    (stage / "sub").mkdir(parents=True)
+    (stage / "a").write_bytes(b"new a")
+    (stage / "sub" / "x").write_bytes(b"new x")
+    backend.merge(str(stage), str(t))
+    assert local_tree(str(root)) == {
+        "t": DIR,
+        "t/a": FILE(b"new a"),
+        "t/keep": FILE(b"kept"),
+        "t/sub": DIR,
+        "t/sub/w": FILE(b"kept w"),
+        "t/sub/x": FILE(b"new x"),
+    }
+
+
+@pytest.mark.parametrize("dst", ["here/s", "to-s/sub", "to-s/inside", "to-sub/deeper"])
+def test_merge_into_itself_or_its_subtree_through_a_symlink_raises_before_anything_moves(
+    backend: LocalBackend, root: Path, dst: str
+) -> None:
+    # here -> ".", to-s -> s, to-sub -> s/sub: each dst is s or lies in it.
+    (root / "s" / "sub").mkdir(parents=True)
+    (root / "s" / "f").write_bytes(b"1")
+    (root / "s" / "empty").mkdir()
+    os.symlink(".", root / "here")
+    os.symlink("s", root / "to-s")
+    os.symlink("s/sub", root / "to-sub")
+    before = local_tree(str(root))
+    with pytest.raises(OperationFailed):
+        backend.merge(str(root / "s"), str(root / dst))
+    assert local_tree(str(root)) == before
+    assert leftovers(root) == []
+
+
+@pytest.mark.parametrize("dst", ["S", "S/sub", "S/inside"])
+def test_merge_into_itself_or_its_subtree_through_a_case_variant_raises_before_anything_moves(
+    backend: LocalBackend, case_insensitive_root: Path, dst: str
+) -> None:
+    root = case_insensitive_root
+    (root / "s" / "sub").mkdir(parents=True)
+    (root / "s" / "f").write_bytes(b"1")
+    (root / "s" / "empty").mkdir()
+    before = local_tree(str(root))
+    with pytest.raises(OperationFailed):
+        backend.merge(str(root / "s"), str(root / dst))
+    assert local_tree(str(root)) == before
+    assert leftovers(root) == []
+
+
+def test_merge_of_a_file_onto_another_hard_link_of_it_leaves_only_the_destination(
+    backend: LocalBackend, root: Path
+) -> None:
+    # rename(2) does nothing when both names link one file; merge must still
+    # replace dst by src, so the name src goes and src's directory can be removed.
+    (root / "s").mkdir()
+    (root / "t").mkdir()
+    (root / "t" / "a").write_bytes(b"one inode")
+    os.link(root / "t" / "a", root / "s" / "a")
+    (root / "s" / "b").write_bytes(b"b")
+    (root / "x").write_bytes(b"top")
+    os.link(root / "x", root / "y")
+    backend.merge(str(root / "s"), str(root / "t"))
+    backend.merge(str(root / "x"), str(root / "y"))
+    assert local_tree(str(root)) == {
+        "t": DIR,
+        "t/a": FILE(b"one inode"),
+        "t/b": FILE(b"b"),
+        "y": FILE(b"top"),
+    }
+
+
+@pytest.mark.parametrize("links", [1, 2], ids=["one-link", "hard-linked"])
+def test_merge_of_a_file_onto_its_own_entry_through_a_symlink_loses_nothing(
+    backend: LocalBackend, root: Path, links: int
+) -> None:
+    # root/here/a is root/a itself: not a separate hard link to remove.
+    (root / "a").write_bytes(b"data")
+    os.symlink(".", root / "here")
+    expected = {"a": FILE(b"data"), "here": LINK(".")}
+    if links == 2:
+        os.link(root / "a", root / "b")
+        expected["b"] = FILE(b"data")
+    backend.merge(str(root / "a"), str(root / "here" / "a"))
+    assert local_tree(str(root)) == expected
+    assert leftovers(root) == []
+
+
+def test_merge_of_a_hard_linked_file_to_a_case_variant_of_its_name_keeps_it(
+    backend: LocalBackend, case_insensitive_root: Path
+) -> None:
+    # "name" is the entry "Name", not the separate link "other".
+    root = case_insensitive_root
+    (root / "Name").write_bytes(b"data")
+    os.link(root / "Name", root / "other")
+    backend.merge(str(root / "Name"), str(root / "name"))
+    names = sorted(os.listdir(root))
+    assert [name.casefold() for name in names] == ["name", "other"], names
+    assert (root / "name").read_bytes() == (root / "other").read_bytes() == b"data"
+    assert leftovers(root) == []

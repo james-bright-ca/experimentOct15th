@@ -8,7 +8,12 @@ Modes (``Settings.btty_exec``)
     containers, and btty-mcp only runs commands), so a script over ``--exec``
     is the way to list. Listing, walk and stat run a ``python3`` program that
     prints JSON records (the user verified python3 and ``--exec --json``
-    live); the mutations run ``sh``.
+    live); the mutations run ``sh``. Pack, unpack and merge (Cap.ARCHIVE) run
+    ``python3`` programs using ``tarfile`` and ``os``; they need the remote's
+    ``tarfile.tar_filter`` (Python 3.12+; the user's remote has 3.12.3) and
+    raise Unsupported without it, as for a command too long to send, so that
+    the caller transfers per file. ``list_dir`` results are cached (see
+    BttyBackend).
     Transfer-only (the opt-out: ``exec = false`` or ``--no-btty-exec``): caps
     are {UPLOAD, DOWNLOAD}. Only btty's native single-file ``--put`` and
     ``--get`` are used. Without STAT nothing can check whether a remote file
@@ -32,8 +37,14 @@ argv shapes (``cmd`` is ``Settings.btty_command``)
              The ``--out`` path is a name inside a fresh temporary directory, so
              it never exists. The file is then installed at ``local_dest``.
     exec     ``[cmd, "--yes", "--no-launch", "--allow-unrestricted", "--json",
-             "--timeout", str(Settings.btty_timeout), "--exec", <script>]``
+             "--timeout", <seconds>, "--exec", <script>]``
              Each script is at most ``btty_scripts.COMMAND_BUDGET`` UTF-8 bytes.
+             The timeout is ``str(Settings.btty_archive_timeout)`` for the
+             pack, unpack and merge scripts and ``str(Settings.btty_timeout)``
+             for every other script.
+    pack with more names than one script holds first uploads them, NUL
+             separated, with the upload shape to ``<archive>.names``; the pack
+             script reads and removes that file.
 
 What the runner must return (btty's own behaviour, bcli src/btty/cli.ts)
     * Every call, ``--json`` or not, may first print btty's informational line
@@ -83,8 +94,9 @@ import stat
 import subprocess
 import tempfile
 import threading
-from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from collections import OrderedDict
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager, suppress
 
 from twinfm.backend.base import (
     ALL_CAPS,
@@ -106,11 +118,15 @@ from twinfm.backend.btty_scripts import (
     delete_scripts,
     error_for,
     list_script,
+    merge_script,
     mkdir_script,
+    pack_list_script,
+    pack_script,
     parse_output,
     rename_script,
     stat_script,
     to_entry,
+    unpack_script,
     walk_script,
 )
 from twinfm.backend.local import install_file
@@ -126,6 +142,9 @@ TRANSFER_CAPS: frozenset[Cap] = frozenset({Cap.UPLOAD, Cap.DOWNLOAD})
 
 _INFO = re.compile(r"btty: \S+ on \S+")
 """btty's informational first line, ``btty: <container-id> on <host>``."""
+
+_CACHE_SIZE = 256
+"""How many directory listings a BttyBackend keeps (least recently used go first)."""
 
 _FAILED = ("not valid shell syntax", "byte line, over the", "byte command line, over the")
 _UNSUPPORTED = ("refusing to run in", "requires --user")
@@ -255,12 +274,31 @@ def _json_result(*streams: str) -> tuple[str, int] | None:
     return None
 
 
-class BttyBackend(Backend):
-    """The remote workspace over btty. Construction does no I/O. Stateless
-    apart from its settings and runner, so it is thread-safe.
+def _within(path: str, root: str) -> bool:
+    """Whether absolute ``path`` is ``root`` or below it."""
+    return root == "/" or path == root or path.startswith(root + "/")
 
-    Beyond the Backend contract it offers ``delete_many``, which deletes many
-    paths in as few btty calls as the command budget allows.
+
+class BttyBackend(Backend):
+    """The remote workspace over btty. Construction does no I/O. Thread-safe:
+    besides its settings and runner it holds only the listing cache, which a
+    lock guards.
+
+    ``delete_many`` deletes many paths in as few btty calls as the command
+    budget allows. ``archive_dir`` is ``Settings.remote_tmp`` and
+    ``archive_max_bytes`` is ``Settings.archive_max_bytes``.
+
+    Listing cache
+        ``list_dir`` results are kept per absolute path, for the
+        ``_CACHE_SIZE`` most recently used directories, and every call
+        returns a new list. ``stat`` and ``walk`` are never cached. Every
+        mutation drops, in a ``finally``, the listings it may have changed
+        (the table in base.py's Semantics), and ``invalidate`` drops them on
+        request. The lock is never held across a btty call: a listing is
+        stored only if nothing was invalidated while it ran. Both panels
+        share the cache, because ``open_btty`` returns one backend per
+        Settings. Changes made by anything else on the remote stay invisible
+        until ``invalidate``.
     """
 
     id = "btty"
@@ -270,6 +308,11 @@ class BttyBackend(Backend):
         self.settings = settings
         self.runner: Runner = runner if runner is not None else run_btty
         self.caps = ALL_CAPS if settings.btty_exec else TRANSFER_CAPS
+        self.archive_dir = settings.remote_tmp
+        self.archive_max_bytes = settings.archive_max_bytes
+        self._cache: OrderedDict[str, list[Entry]] = OrderedDict()
+        self._cache_lock = threading.Lock()
+        self._generation = 0  # bumped by every invalidation
 
     # -- running btty -------------------------------------------------------------
 
@@ -290,8 +333,9 @@ class BttyBackend(Backend):
         if code != 0:
             raise self._failure(path, code, stdout, stderr)
 
-    def _script(self, script: str, path: str) -> ScriptOutput:
-        """Run ``script`` with ``btty --exec``; raise what it reports, if anything."""
+    def _script(self, script: str, path: str, timeout: int | None = None) -> ScriptOutput:
+        """Run ``script`` with ``btty --exec`` and ``--timeout`` (``btty_timeout``
+        unless given); raise what it reports, if anything."""
         s = self.settings
         argv = [
             s.btty_command,
@@ -300,7 +344,7 @@ class BttyBackend(Backend):
             "--allow-unrestricted",
             "--json",
             "--timeout",
-            str(s.btty_timeout),
+            str(s.btty_timeout if timeout is None else timeout),
             "--exec",
             script,
         ]
@@ -334,7 +378,20 @@ class BttyBackend(Backend):
     def list_dir(self, path: str) -> list[Entry]:
         self.require(Cap.LIST, path)
         path = self._abs(path)
-        return [to_entry(r, path) for r in self._script(list_script(path), path).entries]
+        with self._cache_lock:
+            cached = self._cache.get(path)
+            if cached is not None:
+                self._cache.move_to_end(path)
+                return list(cached)
+            generation = self._generation
+        entries = [to_entry(r, path) for r in self._script(list_script(path), path).entries]
+        with self._cache_lock:
+            if self._generation == generation:
+                self._cache[path] = entries
+                self._cache.move_to_end(path)
+                if len(self._cache) > _CACHE_SIZE:
+                    self._cache.popitem(last=False)
+        return list(entries)
 
     def walk(self, path: str) -> list[Entry]:
         self.require(Cap.LIST, path)
@@ -364,7 +421,10 @@ class BttyBackend(Backend):
     def mkdir(self, path: str) -> None:
         self.require(Cap.MKDIR, path)
         path = self._abs(path)
-        self._script(mkdir_script(path), path)
+        try:
+            self._script(mkdir_script(path), path)
+        finally:
+            self._forget([posixpath.dirname(path)])
 
     def delete(self, path: str, recursive: bool = False) -> None:
         self.require(Cap.DELETE, path)
@@ -382,18 +442,109 @@ class BttyBackend(Backend):
         targets = [self._abs(p) for p in paths]
         if "/" in targets:
             raise OperationFailed("/", "refusing to delete the root directory", self.id)
-        for chunk, script in delete_scripts(targets, recursive):
-            self._script(script, chunk[0])
+        try:
+            for chunk, script in delete_scripts(targets, recursive):
+                self._script(script, chunk[0])
+        finally:
+            self._forget([posixpath.dirname(p) for p in targets], targets)
 
     def rename(self, src: str, dst: str, overwrite: bool = False) -> None:
         self.require(Cap.RENAME, src)
         src, dst = self._abs(src), self._abs(dst)
-        self._script(rename_script(src, dst, overwrite), src)
+        try:
+            self._script(rename_script(src, dst, overwrite), src)
+        finally:
+            self._forget([posixpath.dirname(src), posixpath.dirname(dst)], [src, dst])
 
     def copy_within(self, src: str, dst: str, overwrite: bool = False) -> None:
         self.require(Cap.COPY_WITHIN, src)
         src, dst = self._abs(src), self._abs(dst)
-        self._script(copy_script(src, dst, overwrite), src)
+        try:
+            self._script(copy_script(src, dst, overwrite), src)
+        finally:
+            self._forget([posixpath.dirname(dst)], [dst])
+
+    # -- archives -----------------------------------------------------------------
+
+    def pack(self, parent: str, names: Sequence[str], archive: str) -> None:
+        self.require(Cap.ARCHIVE, parent)
+        parent, archive = self._abs(parent), self._abs(archive)
+        for name in names:
+            if name in ("", ".", "..") or "/" in name or "\0" in name:
+                raise OperationFailed(
+                    posixpath.join(parent, name), "not a name inside the directory", self.id
+                )
+        script = pack_script(parent, names, archive)
+        listing: str | None = None
+        try:
+            if script is None:
+                # Too many names for one command: they go up as a file next to
+                # the archive, which the pack program reads and removes.
+                names_file = archive + ".names"
+                script = pack_list_script(parent, names_file, archive)
+                self._put_names(names_file, names)
+                listing = names_file
+            self._script(script, parent, self.settings.btty_archive_timeout)
+        except FsError:
+            if listing is not None:
+                # The program removes the file first; this is for a run that never started.
+                with suppress(FsError):
+                    self._delete([listing], False)
+            raise
+        finally:
+            self._forget([posixpath.dirname(archive)])
+
+    def _put_names(self, path: str, names: Sequence[str]) -> None:
+        """Upload ``names``, NUL-separated, to the remote file ``path``."""
+        with self._local(path):
+            fd, local = tempfile.mkstemp(prefix="twinfm-btty-")
+        try:
+            with self._local(path), os.fdopen(fd, "wb") as f:
+                f.write(b"\0".join(n.encode("utf-8", "surrogateescape") for n in names))
+            self._transfer(
+                [self.settings.btty_command, "--yes", "--put", local, "--to", path], path
+            )
+        finally:
+            with suppress(OSError):
+                os.unlink(local)
+
+    def unpack(self, archive: str, dest: str) -> None:
+        self.require(Cap.ARCHIVE, archive)
+        archive, dest = self._abs(archive), self._abs(dest)
+        script = unpack_script(archive, dest)
+        try:
+            self._script(script, archive, self.settings.btty_archive_timeout)
+        finally:
+            self._forget([posixpath.dirname(archive), posixpath.dirname(dest)], [dest])
+
+    def merge(self, src: str, dst: str) -> None:
+        self.require(Cap.ARCHIVE, src)
+        src, dst = self._abs(src), self._abs(dst)
+        if _within(dst, src):
+            raise OperationFailed(dst, "cannot merge a directory into itself", self.id)
+        script = merge_script(src, dst)
+        try:
+            self._script(script, src, self.settings.btty_archive_timeout)
+        finally:
+            self._forget([posixpath.dirname(src), posixpath.dirname(dst)], [src, dst])
+
+    # -- listing cache ------------------------------------------------------------
+
+    def invalidate(self, path: str | None = None) -> None:
+        # A path _abs would refuse (a NUL byte) drops everything rather than raise.
+        root = "/" if path is None or "\0" in path else self._abs(path)
+        self._forget((), [root])
+
+    def _forget(self, listings: Iterable[str], trees: Iterable[str] = ()) -> None:
+        """Drop the cached listings of the directories ``listings`` and of
+        every directory in the subtrees ``trees``, and keep any listing still
+        running from being stored."""
+        listings, trees = set(listings), list(trees)
+        with self._cache_lock:
+            self._generation += 1
+            for key in list(self._cache):
+                if key in listings or any(_within(key, t) for t in trees):
+                    del self._cache[key]
 
     # -- cross-backend primitives -------------------------------------------------
 
@@ -464,9 +615,12 @@ class BttyBackend(Backend):
                     # --put moves its temporary file onto the path with `mv`, which
                     # would land inside the directory a symlink points to.
                     self.delete(path)
-        self._transfer(
-            [self.settings.btty_command, "--yes", "--put", local_src, "--to", path], path
-        )
+        try:
+            self._transfer(
+                [self.settings.btty_command, "--yes", "--put", local_src, "--to", path], path
+            )
+        finally:
+            self._forget([posixpath.dirname(path)])
 
 
 _shared: dict[Settings, BttyBackend] = {}

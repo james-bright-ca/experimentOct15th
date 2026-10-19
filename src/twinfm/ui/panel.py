@@ -7,7 +7,11 @@ regard to case; dotfiles are shown. A backend without Cap.LIST gets a
 transfer-only view: a message instead of a listing.
 
 Listing runs in a Textual thread worker; the result comes back to the UI
-thread through ``call_from_thread``.
+thread through ``call_from_thread``. Ctrl-R refreshes: its worker first
+drops the backend's cached listings of the directory (``Backend.invalidate``),
+so that changes made outside twinfm show up. Every other listing may come
+from the backend's cache, which the backend keeps current for twinfm's own
+operations.
 """
 
 from __future__ import annotations
@@ -127,7 +131,7 @@ class Panel(Vertical):
     BINDINGS = [
         Binding("space,insert,ctrl+t", "toggle_select", "Select", show=False),
         Binding("backspace", "parent", "Parent directory", show=False),
-        Binding("ctrl+r", "reload", "Reload", show=False),
+        Binding("ctrl+r", "reload", "Refresh", key_display="^R"),
     ]
 
     def __init__(self, backend: Backend, path: str, *, id: str | None = None) -> None:
@@ -207,12 +211,20 @@ class Panel(Vertical):
 
     # -- loading ---------------------------------------------------------------
 
-    def load(self, path: str, cursor: str | None = None, backend: Backend | None = None) -> None:
+    def load(
+        self,
+        path: str,
+        cursor: str | None = None,
+        backend: Backend | None = None,
+        *,
+        fresh: bool = False,
+    ) -> None:
         """List ``path`` on ``backend`` (default: the current one) in a worker
-        and show it, with the cursor on ``cursor`` if that name is listed."""
+        and show it, with the cursor on ``cursor`` if that name is listed.
+        ``fresh`` drops the backend's cached listings of ``path`` first."""
         self._status.update("Loading...")
         self.run_worker(
-            partial(self._list, self.app, backend or self.backend, path, cursor),
+            partial(self._list, self.app, backend or self.backend, path, cursor, fresh),
             thread=True,
             group="list",
             exclusive=True,
@@ -223,11 +235,15 @@ class Panel(Vertical):
         """List the current directory again, keeping the cursor on its name."""
         self.load(self.path, cursor or self.cursor_name)
 
-    def _list(self, app: App[object], backend: Backend, path: str, cursor: str | None) -> None:
+    def _list(
+        self, app: App[object], backend: Backend, path: str, cursor: str | None, fresh: bool
+    ) -> None:
         worker = get_current_worker()
         entries: list[Entry] | None = None
         error: FsError | None = None
         if Cap.LIST in backend.caps:
+            if fresh:
+                backend.invalidate(path)
             try:
                 entries = backend.list_dir(path)
             except FsError as e:
@@ -347,8 +363,9 @@ class Panel(Vertical):
         self.load(self.backend.parent(self.path), posixpath.basename(self.path))
 
     def action_reload(self) -> None:
+        """Ctrl-R: list the current directory again, past any cached listing."""
         if self.listable:
-            self.reload()
+            self.load(self.path, self.cursor_name, fresh=True)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         event.stop()
