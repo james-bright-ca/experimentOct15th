@@ -6,7 +6,10 @@ from tests/ui/support.py, plus
   threading tests read the order);
 * ``parse_keys`` / ``send_bytes``: real terminal bytes through Textual's own
   xterm parser, for keys that Pilot's key names cannot produce (such as the
-  ``¢`` a fast ESC+4 or Option-4 becomes)."""
+  ``¢`` a fast ESC+4 or Option-4 becomes);
+* the autouse ``shell_guard``: $SHELL is the fake shell (tests/ui/fake_shell.py)
+  for every test, so a LocalShell (Ctrl-O) can never start the user's real
+  shell or read its rc files."""
 
 from __future__ import annotations
 
@@ -20,8 +23,10 @@ from textual import constants, events
 from textual._xterm_parser import XTermParser
 from textual.pilot import Pilot
 
+from tests.ui import fake_shell
 from tests.ui.support import RecordingLocal, RecordingMemory, StubEngine, on_main_thread
 from twinfm.backend.base import Entry
+from twinfm.ui.shell import default_shell
 
 FILES = {"b.txt": b"bb", "A.txt": b"aaa", ".hidden": b"h", "c.txt": b"c" * 2000, "Zeta.md": b"z"}
 DIRS = ["Sub", "alpha", ".git"]
@@ -43,6 +48,26 @@ class Tree:
     @property
     def R(self) -> str:
         return str(self.right)
+
+
+@pytest.fixture(scope="session")
+def fake_shell_path(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """The fake shell as an executable named ``sh`` (see tests/ui/fake_shell.py)."""
+    return fake_shell.install(tmp_path_factory.mktemp("fake-shell"))
+
+
+@pytest.fixture(autouse=True)
+def shell_guard(fake_shell_path: str, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Autouse: $SHELL is the fake shell for the whole test, and the shell a
+    LocalShell would start (``default_shell()``) is that fake. An unresolvable
+    $SHELL would fall back to the user's real login shell, so the fixture
+    fails the test rather than let that happen."""
+    monkeypatch.setenv("SHELL", fake_shell_path)
+    resolved = default_shell()
+    assert resolved == [fake_shell_path, "-i"], (
+        f"shell guard: default_shell() is {resolved}, not the fake shell {fake_shell_path}"
+    )
+    return fake_shell_path
 
 
 @pytest.fixture

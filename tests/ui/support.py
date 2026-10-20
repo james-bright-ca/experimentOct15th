@@ -8,6 +8,9 @@
   thread each ``list_dir`` ran on.
 * ``FakeConnector`` stands in for the backend registry used by F9 (Connect),
   so no test ever opens a real btty backend.
+* ``FakeCommand`` (run_viewer / run_editor), ``FakeShellRunner`` (run_shell)
+  and ``FakeShell`` (the app's shell) record what the app would hand the
+  terminal to, so no test starts more, an editor or a shell.
 * ``Notes`` records every notification the app shows.
 * ``settle`` / ``wait_until`` / ``move_to`` drive the Pilot.
 """
@@ -245,6 +248,63 @@ class Hold:
             self.release.wait(10)
 
 
+# -- programs the app hands the terminal to ------------------------------------------
+
+
+class FakeCommand:
+    """A ``run_viewer`` / ``run_editor``: records each argv, runs ``effect``
+    on it, and returns ``status``, or raises ``raises``."""
+
+    def __init__(
+        self,
+        status: int = 0,
+        raises: BaseException | None = None,
+        effect: Callable[[list[str]], None] | None = None,
+    ) -> None:
+        self.status = status
+        self.raises = raises
+        self.effect = effect
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv: list[str]) -> int:
+        self.calls.append(list(argv))
+        if self.effect is not None:
+            self.effect(argv)
+        if self.raises is not None:
+            raise self.raises
+        return self.status
+
+
+class FakeShellRunner:
+    """A ``run_shell``: records each ``(start_dir, panel_dir)`` and returns
+    ``visit`` (default: no exit, no move), or raises ``raises``."""
+
+    def __init__(self, visit: Any = None, raises: BaseException | None = None) -> None:
+        from twinfm.ui.shell import ShellVisit
+
+        self.visit = visit if visit is not None else ShellVisit(exited=None, cwd=None, moved=False)
+        self.raises = raises
+        self.calls: list[tuple[str, str | None]] = []
+
+    def __call__(self, start_dir: str, panel_dir: str | None) -> Any:
+        self.calls.append((start_dir, panel_dir))
+        if self.raises is not None:
+            raise self.raises
+        return self.visit
+
+
+class FakeShell:
+    """Stands in for the app's LocalShell: ``running`` is set by the test,
+    ``close`` is counted. It never starts a process."""
+
+    def __init__(self, running: bool = False) -> None:
+        self.running = running
+        self.closed = 0
+
+    def close(self, timeout: float = 1.0) -> None:
+        self.closed += 1
+
+
 # -- the app ----------------------------------------------------------------------
 
 
@@ -253,14 +313,25 @@ def make_app(
     right: tuple[Backend, str],
     engine: StubEngine | None = None,
     connector: FakeConnector | None = None,
+    *,
+    run_editor: Callable[[list[str]], int] | None = None,
+    run_viewer: Callable[[list[str]], int] | None = None,
+    run_shell: Callable[[str, str | None], Any] | None = None,
+    shell: Any = None,
 ) -> TwinFM:
-    """TwinFM with a stub engine and a fake connector (never the registry)."""
+    """TwinFM with a stub engine and a fake connector (never the registry).
+    ``run_editor`` (F4), ``run_viewer`` (F3), ``run_shell`` (Ctrl-O) and
+    ``shell`` are passed on when given; left out, the app's defaults apply."""
     return TwinFM(
         left,
         right,
         Settings(btty_exec=False),
         engine=engine if engine is not None else StubEngine(),
         open_backend=connector if connector is not None else FakeConnector(),
+        run_editor=run_editor,
+        run_viewer=run_viewer,
+        run_shell=run_shell,
+        shell=shell,
     )
 
 

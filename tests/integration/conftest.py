@@ -7,7 +7,9 @@ whose runner is FakeBtty (tests/backend/fake_btty.py), which emulates btty
 over a second directory below tmp_path and runs the remote python3 programs
 locally. Nothing here can reach the real btty: the runner is injected, Connect
 goes through FakeConnector, and the conftest PATH guard still stands behind
-both. F4 gets a recording ``run_editor``, never vim.
+both. F4 gets a recording ``run_editor``, never vim. The autouse
+``shell_guard`` makes $SHELL the fake shell (tests/ui/fake_shell.py), so
+Ctrl-O can never start the user's real shell.
 
 Layout of ``world`` (all resolved, because macOS's /var is a symlink and
 FakeBtty wants normalised absolute paths)::
@@ -33,8 +35,30 @@ import pytest
 
 from tests.backend.fake_btty import FakeBtty, script_env, settings_for
 from tests.integration.support import ARCHIVE_TIMEOUT, TIMEOUT, World
+from tests.ui import fake_shell
 from twinfm.backend.btty import BttyBackend
 from twinfm.backend.local import LocalBackend
+from twinfm.ui.shell import default_shell
+
+
+@pytest.fixture(scope="session")
+def fake_shell_path(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """The fake shell as an executable named ``sh`` (see tests/ui/fake_shell.py)."""
+    return fake_shell.install(tmp_path_factory.mktemp("fake-shell"))
+
+
+@pytest.fixture(autouse=True)
+def shell_guard(fake_shell_path: str, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Autouse: $SHELL is the fake shell for the whole test, and the shell a
+    LocalShell would start (``default_shell()``) is that fake. An unresolvable
+    $SHELL would fall back to the user's real login shell, so the fixture
+    fails the test rather than let that happen."""
+    monkeypatch.setenv("SHELL", fake_shell_path)
+    resolved = default_shell()
+    assert resolved == [fake_shell_path, "-i"], (
+        f"shell guard: default_shell() is {resolved}, not the fake shell {fake_shell_path}"
+    )
+    return fake_shell_path
 
 
 @pytest.fixture(autouse=True)

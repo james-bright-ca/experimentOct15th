@@ -11,19 +11,40 @@ is F5 ... Esc 0 is F10), typed slowly or fast, or Option with the digit on a
 US layout (the character it types, such as ∞ for Option-5, is read as that
 digit).
 
-F4 (or Esc then 4, or Option-4) edits the file on the cursor row of a local
-panel in $VISUAL, else $EDITOR, else vim, with the app suspended until the
-editor exits. Ctrl-R reloads past any cached listing: a backend may cache
-listings (btty does) and keeps them current only for twinfm's own changes.
-F5 and F6 of a folder or several items between a local panel and another
-store that packs archives (Cap.ARCHIVE) offer an Archive checkbox, checked:
-the batch then travels as one archive (see ``Engine.copy``).
+Typing any other character (not Space) opens the active panel's find line:
+the cursor goes to the first name that matches, Up / Down step through the
+matches, Enter closes the line and opens a matching directory, and Esc or
+any other key closes it. Text with a ``/``, ``~`` alone or ``KIND:`` is a
+path: Enter goes there.
+A modifier key pressed on its own (Shift, Control, Option, Command, Caps
+Lock) does not close the line; it waits for the key the modifier goes with.
+
+F3 (or Esc then 3, or Option-3) views the file on the cursor row of a local
+panel with more; the footer has no room for it in 80 columns. F4 (or
+Esc then 4, or Option-4) edits that file in $VISUAL, else $EDITOR, else vim.
+The app is suspended until the viewer or the editor exits. Ctrl-R reloads
+past any cached listing: a backend may cache listings (btty does) and keeps
+them current only for twinfm's own changes. F5 and F6 of a folder or several
+items between a local panel and another store that packs archives
+(Cap.ARCHIVE) offer an Archive checkbox, checked: the batch then travels as
+one archive (see ``Engine.copy``).
+
+Ctrl-O hides the panels and shows a local shell in the terminal, as Midnight
+Commander does; Ctrl-O again brings the panels back. The shell stays alive
+in the background between visits. It is always a local shell, never a btty
+one, whatever the panels show.
+
+While the active panel is loading a listing (its status line reads
+``Loading…``), only Tab, Shift+Tab and quit (F10, Esc then 0, Option-0,
+Ctrl-Q) work: every other key, a paste and a click on its rows are ignored.
+The other panel, once listed, works as usual.
 
 Threading: the UI thread never calls a backend or the engine. Listings,
 connects and operations run in Textual thread workers. When the engine needs
 an answer, its callback pushes a dialog through ``call_from_thread`` and
-waits for it on the worker thread. The editor (F4) blocks the UI thread
-while it runs; workers carry on, and their questions wait until it exits.
+waits for it on the worker thread. The viewer (F3), the editor (F4) and the
+shell (Ctrl-O) block the UI thread while they have the terminal; workers
+carry on, and their questions wait until the panels are back.
 """
 
 from __future__ import annotations
@@ -33,6 +54,7 @@ import os
 import posixpath
 import shlex
 import subprocess
+import sys
 import threading
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
@@ -61,16 +83,20 @@ from twinfm.ui.dialogs import (
     SummaryDialog,
     TransferDialog,
 )
+from twinfm.ui.find import first_match, is_path, location_kind, resolve
 from twinfm.ui.panel import Panel
+from twinfm.ui.shell import LocalShell, ShellVisit
 
 __all__ = ["FileManagerScreen", "TwinFM"]
 
 Location = tuple[Backend, str]
 OpenBackend = Callable[[str, Settings], Backend]
 RunEditor = Callable[[list[str]], int]
+RunShell = Callable[[str, str | None], ShellVisit]
 
 # Esc then a digit stands for the F-key of that number (0 is F10).
 _ESC_DIGITS = {
+    "3": "view",
     "4": "edit",
     "5": "copy",
     "6": "move",
@@ -82,12 +108,57 @@ _ESC_DIGITS = {
 
 # Textual 8.2.8 reads a fast Esc+digit as the character macOS Option+digit
 # types on a US layout; each stands for its digit.
-_OPTION_DIGITS = {"¢": "4", "∞": "5", "§": "6", "¶": "7", "•": "8", "ª": "9", "º": "0"}
+_OPTION_DIGITS = {"£": "3", "¢": "4", "∞": "5", "§": "6", "¶": "7", "•": "8", "ª": "9", "º": "0"}
+
+# The keys that still work while the active panel is loading, besides Esc
+# then 0 and Option-0 (Ctrl-Q, a priority binding, never reaches the screen).
+_WHILE_LOADING = frozenset({"tab", "shift+tab", "f10", "alt+0"})
+
+# Textual 8.2.8 asks the terminal for kitty keyboard flags 1 | 8 | 16, so a
+# modifier pressed on its own arrives as a key of its own, with no character:
+# the kitty protocol's modifier keys, including the Caps Lock and Num Lock keys.
+_MODIFIER_KEYS = frozenset(
+    {f"{side}_{name}" for side in ("left", "right") for name in ("shift", "control", "alt", "super", "hyper")}
+    | {"left_meta", "right_meta", "iso_level3_shift", "iso_level5_shift", "caps_lock", "num_lock"}
+)
+
+# A kitty terminal that leaves out the text field sends an unmodified key as
+# ESC[<code>u. Textual 8.2.8 names a punctuation key after its character
+# (slash, full_stop, grave_accent, ...) and gives it no character: the
+# character each such name types. Space keeps its own handling.
+_PUNCTUATION_KEYS = {
+    "exclamation_mark": "!", "quotation_mark": '"', "number_sign": "#", "dollar_sign": "$",
+    "percent_sign": "%", "ampersand": "&", "apostrophe": "'", "left_parenthesis": "(",
+    "right_parenthesis": ")", "asterisk": "*", "plus": "+", "comma": ",", "minus": "-",
+    "full_stop": ".", "slash": "/", "colon": ":", "semicolon": ";", "less_than_sign": "<",
+    "equals_sign": "=", "greater_than_sign": ">", "question_mark": "?", "at": "@",
+    "left_square_bracket": "[", "backslash": "\\", "right_square_bracket": "]",
+    "circumflex_accent": "^", "underscore": "_", "grave_accent": "`",
+    "left_curly_bracket": "{", "vertical_line": "|", "right_curly_bracket": "}", "tilde": "~",
+}
 
 
 def _normalised(path: str) -> str:
     # normpath keeps a POSIX leading "//"; backend paths start with exactly one "/".
     return "/" + posixpath.normpath(path).lstrip("/")
+
+
+def _typed(event: events.Key) -> str | None:
+    """The character ``event`` types into the find line: a printable one,
+    with no modifier but Shift (a fast Esc+letter arrives as ``alt+``)."""
+    # A kitty terminal that leaves out the text field sends Shift+U as
+    # ESC[117;2u, which Textual reads as shift+u with no character.
+    modifiers, _, name = event.key.rpartition("+")
+    if event.character is None and modifiers == "shift" and len(name) == 1 and "a" <= name <= "z":
+        return name.upper()
+    # ESC[47u, an unmodified "/" without the text field, is slash with no character.
+    if event.character is None and event.key in _PUNCTUATION_KEYS:
+        return _PUNCTUATION_KEYS[event.key]
+    if not event.is_printable or not event.character:
+        return None
+    if any(modifier != "shift" for modifier in event.key.split("+")[:-1]):
+        return None
+    return event.character
 
 
 def _editor_argv(path: str) -> list[str]:
@@ -127,6 +198,8 @@ class FileManagerScreen(Screen[None]):
     """
 
     BINDINGS = [
+        # Not in the footer, which has no room for it at 80 columns.
+        Binding("f3", "app.view", "View", key_display="F3", show=False),
         Binding("f4", "app.edit", "Edit", key_display="F4"),
         Binding("f5", "app.copy", "Copy", key_display="F5"),
         Binding("f6", "app.move", "Move", key_display="F6"),
@@ -137,6 +210,7 @@ class FileManagerScreen(Screen[None]):
         Binding("f8", "app.delete", "Del", key_display="F8"),
         Binding("f9", "app.connect", "Connect", key_display="F9"),
         Binding("f10", "app.quit", "Quit", key_display="F10"),
+        Binding("ctrl+o", "app.shell", "Shell", show=False),
         *(Binding(f"alt+{digit}", f"app.{action}", show=False) for digit, action in _ESC_DIGITS.items()),
     ]
 
@@ -158,13 +232,42 @@ class FileManagerScreen(Screen[None]):
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
         for node in event.widget.ancestors_with_self:
             if isinstance(node, Panel):
+                if node is not self.active_panel:
+                    self.active_panel.find_close()
                 self.active_panel = node
                 return
+
+    def on_screen_suspend(self, event: events.ScreenSuspend) -> None:
+        # A dialog opened over this screen.
+        self.left_panel.find_close()
+        self.right_panel.find_close()
+
+    def on_paste(self, event: events.Paste) -> None:
+        panel = self.active_panel
+        if panel.is_loading:
+            event.stop()  # dropped, as a typed key is
+            return
+        if panel.listable:
+            event.stop()
+            panel.find_type(event.text.splitlines()[0] if event.text else "")
 
     async def on_key(self, event: events.Key) -> None:
         # Keys reach this screen after the focused widget and before the
         # app's bindings; dialogs are other screens, so their Esc never lands here.
+        panel = self.active_panel
+        if panel.is_loading:
+            # Only Tab and quit go on; Esc only arms its prefix, for Esc then 0.
+            if event.key == "escape":
+                self._esc_pending = True
+                event.stop()
+                return
+            digit = event.key if self._esc_pending else _OPTION_DIGITS.get(event.character or "", "")
+            if event.key not in _WHILE_LOADING and _ESC_DIGITS.get(digit) != "quit":
+                self._esc_pending = False
+                event.stop()
+                return
         if event.key == "escape":
+            panel.find_close()
             self._esc_pending = True
             event.stop()
             return
@@ -176,7 +279,45 @@ class FileManagerScreen(Screen[None]):
         action = _ESC_DIGITS.get(digit)
         if action is not None:
             event.stop()
+            panel.find_close()
             await self.app.run_action(action)
+            return
+        if panel.finding:
+            self._find_key(panel, event)
+            return
+        char = _typed(event)
+        if char is not None and char != " " and panel.listable:
+            event.stop()
+            panel.find_type(char)
+
+    def _find_key(self, panel: Panel, event: events.Key) -> None:
+        """A key while ``panel``'s find line is open. A key the line does not
+        use closes it and goes on to do its own job on the cursor row."""
+        # A modifier pressed on its own is not such a key: the line stays open.
+        char = _typed(event)
+        key = event.key
+        if char is not None:
+            panel.find_type(char)
+        elif key == "backspace":
+            panel.find_backspace()
+        elif key == "ctrl+u":
+            panel.find_clear()
+        elif key in ("up", "down"):
+            panel.find_step(1 if key == "down" else -1)
+        elif key == "enter":
+            text = panel.find_text
+            if is_path(text, registry.available()):
+                cast("TwinFM", self.app).go_to_typed(panel, text)
+            else:
+                panel.find_close()
+                if first_match(text, panel.names) is not None:
+                    return  # the listing's Enter opens the match
+        elif key in _MODIFIER_KEYS:
+            return  # a modifier on its own: the line waits for the key it modifies
+        else:
+            panel.find_close()
+            return
+        event.stop()
 
 
 class TwinFM(App[None]):
@@ -186,7 +327,11 @@ class TwinFM(App[None]):
     use; ``open_backend`` (used by Connect) defaults to the backend registry.
     ``run_editor(argv)`` (used by F4) runs the editor command ``argv`` and
     returns its exit status; the default suspends the app and runs it in the
-    terminal.
+    terminal. ``run_viewer(argv)`` (used by F3) does the same for the viewer.
+    ``run_shell(start_dir, panel_dir)`` (used by Ctrl-O) shows the local shell
+    and returns how the visit ended; the default suspends the app and hands
+    the terminal to ``shell`` (default: a ``LocalShell``, which starts nothing
+    until the first Ctrl-O). Quit asks first while a command runs in it.
     """
 
     TITLE = "twinfm"
@@ -199,13 +344,19 @@ class TwinFM(App[None]):
         engine: Engine | None = None,
         open_backend: OpenBackend | None = None,
         run_editor: RunEditor | None = None,
+        run_viewer: RunEditor | None = None,
+        run_shell: RunShell | None = None,
+        shell: LocalShell | None = None,
     ) -> None:
         super().__init__()
         self.settings = settings
         self._locations = (left, right)
         self._engine = engine
         self._open_backend = open_backend or registry.open_backend
-        self._run_editor = run_editor or self._edit_suspended
+        self._run_editor = run_editor or self._run_suspended
+        self._run_viewer = run_viewer or self._run_suspended
+        self._run_shell = run_shell or self._visit_shell
+        self._shell = shell if shell is not None else LocalShell()
         self._stopping = threading.Event()
         self._main: FileManagerScreen | None = None
 
@@ -218,6 +369,7 @@ class TwinFM(App[None]):
 
     def on_unmount(self) -> None:
         self._stopping.set()
+        self._shell.close()
 
     # -- state -------------------------------------------------------------------
 
@@ -267,6 +419,33 @@ class TwinFM(App[None]):
     def _not_available(self, what: str) -> None:
         self.notify(f"{what} is not available in transfer-only mode", severity="warning")
 
+    def action_view(self) -> None:
+        """F3: view the file on the cursor row of a local panel with more,
+        then list the panel again with the cursor on it."""
+        panel = self.active_panel
+        if not isinstance(panel.backend, LocalBackend):
+            self.notify(
+                "F3 views local files only; copy the file to a local panel to view it",
+                severity="warning",
+            )
+            return
+        entry = panel.cursor_entry
+        if entry is None:
+            return
+        if entry.kind != "file" and not (entry.kind == "symlink" and entry.target_kind == "file"):
+            self.notify(f'"{entry.name}" is not a file', title="View", severity="warning", markup=False)
+            return
+        try:
+            status = self._run_viewer(["more", entry.path])
+        except SuspendNotSupported:
+            self.notify("This terminal cannot be handed over to a viewer", title="View")
+        except OSError as e:
+            self.notify(str(e), title="Cannot start more", severity="error", markup=False)
+        else:
+            if status != 0:
+                self.notify(f"more exited with status {status}", title="View", severity="warning")
+        self._refresh([panel.backend], panel, entry.name)
+
     def action_edit(self) -> None:
         """F4: edit the file on the cursor row of a local panel, then list the
         panel again with the cursor on it."""
@@ -294,8 +473,9 @@ class TwinFM(App[None]):
                 self.notify(f"The editor exited with status {status}", title="Edit", severity="warning")
         self._refresh([panel.backend], panel, entry.name)
 
-    def _edit_suspended(self, argv: list[str]) -> int:
-        """The default ``run_editor``: give the terminal to ``argv`` until it exits."""
+    def _run_suspended(self, argv: list[str]) -> int:
+        """The default ``run_editor`` and ``run_viewer``: give the terminal to
+        ``argv`` until it exits."""
         failure: OSError | None = None
         status = 0
         with self.suspend():
@@ -308,6 +488,72 @@ class TwinFM(App[None]):
         if failure is not None:
             raise failure
         return status
+
+    def action_shell(self) -> None:
+        """Ctrl-O: hide the panels and show the local shell (never a btty one)
+        until Ctrl-O again. It starts in the active panel's directory when that
+        panel is local, else in the other panel's if that one is, else in
+        twinfm's own; a local active panel then follows the shell's cd."""
+        panel, other = self.active_panel, self.other_panel
+        local = isinstance(panel.backend, LocalBackend)
+        try:
+            if local:
+                start_dir = panel.path
+            elif isinstance(other.backend, LocalBackend):
+                start_dir = other.path
+            else:
+                start_dir = os.getcwd()
+            visit = self._run_shell(start_dir, panel.path if local else None)
+        except SuspendNotSupported:
+            self.notify("This terminal cannot be handed over to a shell", title="Shell")
+            return
+        except OSError as e:
+            self.notify(str(e), title="Cannot start the shell", severity="error", markup=False)
+            return
+        if visit.exited is not None:
+            self.notify(f"The shell exited (status {visit.exited}); Ctrl-O starts a new one", title="Shell")
+        elif (
+            visit.moved
+            and visit.cwd is not None
+            and local
+            and os.path.realpath(visit.cwd) != os.path.realpath(panel.path)
+        ):
+            panel.load(visit.cwd)
+
+    def _visit_shell(self, start_dir: str, panel_dir: str | None) -> ShellVisit:
+        """The default ``run_shell``: give the terminal to the local shell
+        until Ctrl-O or the shell's exit."""
+        failure: OSError | None = None
+        visit = ShellVisit(exited=None, cwd=None, moved=False)
+        with self.suspend():
+            try:
+                visit = self._shell.visit(
+                    start_dir, panel_dir, sys.__stdin__.fileno(), sys.__stderr__.fileno()
+                )
+            except OSError as e:
+                # Raised once the app has the terminal back, as in _run_suspended.
+                failure = e
+        if failure is not None:
+            raise failure
+        return visit
+
+    async def action_quit(self) -> None:
+        """F10, Esc then 0, Option-0 and Ctrl-Q: quit, asking first while a
+        command is still running in the shell."""
+        if not self._shell.running:
+            self.exit()
+            return
+
+        def answered(ok: bool | None) -> None:
+            if ok:
+                self.exit()
+
+        self.push_screen(
+            ConfirmDialog(
+                "Quit", "A command is still running in the shell. Quit anyway?", yes="Quit", no="Cancel"
+            ),
+            answered,
+        )
 
     def action_copy(self) -> None:
         self._transfer("copy")
@@ -500,7 +746,24 @@ class TwinFM(App[None]):
             InputDialog("Connect", prompt, f"{panel.backend.id}:{panel.path}"), chosen
         )
 
-    def _connect(self, panel: Panel, text: str, kinds: list[str]) -> None:
+    def go_to_typed(self, panel: Panel, text: str) -> None:
+        """Enter on the path ``text`` in ``panel``'s find line: ``KIND:PATH``
+        connects as F9 does; any other path resolves against the panel's
+        directory, or its backend's home for ``~``."""
+        kinds = registry.available()
+        if location_kind(text, kinds) is not None:
+            self.run_worker(
+                partial(self._connect, panel, text, kinds, go_to=True),
+                thread=True,
+                group="connect",
+                name="connect",
+            )
+        else:
+            panel.go_to(resolve(text, panel.path, panel.backend.home()))
+
+    def _connect(self, panel: Panel, text: str, kinds: list[str], go_to: bool = False) -> None:
+        """Open the location ``text`` (``KIND:PATH`` or a path) in ``panel``,
+        through ``Panel.go_to`` when ``go_to`` (the find line), else as F9 does."""
         backend, base = panel.backend, panel.path
         kind, sep, rest = text.partition(":")
         if sep and kind == backend.id:
@@ -518,7 +781,10 @@ class TwinFM(App[None]):
             path = backend.home()
         else:
             path = _normalised(text if text.startswith("/") else backend.join(base, text))
-        self._call_ui(panel.load, path, None, backend)
+        if go_to:
+            self._call_ui(panel.go_to, path, backend)
+        else:
+            self._call_ui(panel.load, path, None, backend)
 
     # -- running an operation ------------------------------------------------------
 

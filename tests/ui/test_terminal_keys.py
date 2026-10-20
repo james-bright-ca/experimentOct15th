@@ -28,6 +28,7 @@ import twinfm.ui.app as app_module
 from tests.ui.conftest import Tree
 from tests.ui.support import (
     SIZE,
+    FakeCommand,
     RecordingLocal,
     StubEngine,
     assert_alive,
@@ -247,6 +248,42 @@ async def test_escape_digit_bytes_open_what_the_f_key_bytes_open(
     by_escape = await _opened_by(tree, local, *chunks)
     assert by_f_key[0] != "main", f"F{digit} bytes parsed as {by_f_key[2]} opened nothing"
     assert by_escape[:2] == by_f_key[:2], f"Esc {digit} ({typing}) parsed as {by_escape[2]}: {by_escape[:2]} != {by_f_key[:2]}"
+
+
+F3_BYTES = {"xterm-Terminal.app": "\x1bOR", "vt220": "\x1b[13~"}
+OPTION_3 = "£"
+"""Option-3 on a US layout, and what Textual 8.2.8 makes of a fast ESC+3."""
+
+
+async def _viewed_by(tree: Tree, local: RecordingLocal, *chunks: str) -> tuple[list[list[str]], list[str]]:
+    viewer = FakeCommand()
+    app = make_app((local, tree.L), (local, tree.R), StubEngine(), run_viewer=viewer)
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot)
+        await move_to(pilot, app.left_panel, "b.txt")
+        names: list[str] = []
+        for chunk in chunks:
+            names += await _send_bytes(pilot, app, chunk)
+        await settle(pilot)
+        assert app.screen is app.main, f"{chunks!r} opened {type(app.screen).__name__}"
+        return viewer.calls, names
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    [(F3_BYTES["vt220"],), ("\x1b3",), ("\x1b", "3"), (OPTION_3,)],
+    ids=["F3-vt220", "Esc-3-fast", "Esc-3-slow", "Option-3"],
+)
+async def test_f3_bytes_and_escape_3_bytes_view_what_f3_views(
+    tree: Tree, local: RecordingLocal, chunks: tuple[str, ...]
+) -> None:
+    """F3 opens no dialog, so the viewer's calls are compared: the F3 bytes of
+    Terminal.app and xterm (ESC O R), the VT220 form, and Esc 3 typed fast
+    (read as the Option-3 character), slowly, or as Option-3 itself."""
+    by_f_key, f_names = await _viewed_by(tree, local, F3_BYTES["xterm-Terminal.app"])
+    assert by_f_key == [["more", f"{tree.L}/b.txt"]], f"ESC O R parsed as {f_names}"
+    by_other, names = await _viewed_by(tree, local, *chunks)
+    assert by_other == by_f_key, f"{chunks!r} parsed as {names}"
 
 
 @pytest.mark.parametrize(

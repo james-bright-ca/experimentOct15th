@@ -59,6 +59,8 @@ The footer shows the main keys. You can also click them.
 | Backspace | go to the parent directory, with the cursor on the one you left |
 | Tab | switch to the other panel |
 | Space, Insert, Ctrl-T | select or deselect the cursor row and move down (`..` cannot be selected) |
+| a letter, digit or other printable character (not Space) | find a name in the panel, or type a path to go to (see [Find and go to](#find-and-go-to)) |
+| F3 | view the file on the cursor row with `more` (local panels only, not in the footer, see [Viewing files](#viewing-files-f3)) |
 | F4 | edit the file on the cursor row (local panels only, see [Editing files](#editing-files-f4)) |
 | F5 | copy the selection, or the cursor row, to the other panel |
 | F6 | move the selection, or the cursor row, to the other panel |
@@ -68,9 +70,11 @@ The footer shows the main keys. You can also click them.
 | F9 | connect the panel to another location |
 | F10 | quit |
 | Ctrl-R | refresh the panel, past any cached listing (see [Listing cache](#listing-cache-and-ctrl-r)) |
+| Ctrl-O | hide the panels and show a local shell; Ctrl-O again brings the panels back (see [The shell](#the-shell-ctrl-o)) |
 
 The status line under each panel shows the number of items, or the number of
-selected items and the total size of the selected files.
+selected items and the total size of the selected files. While the panel is
+loading it reads `Loading…` (see [While a panel is loading](#while-a-panel-is-loading)).
 
 F5 and F6 ask for the target, prefilled with the other panel's directory. An
 existing directory receives the items. With one item, a path that does not
@@ -83,17 +87,72 @@ path without `KIND:` stays on the panel's current store, and an empty `PATH`
 is that store's home directory (your home directory for `local`, the remote
 home for `btty`).
 
+### Find and go to
+
+Type in a panel to find a name in it. Any printable character except Space
+opens the find line, which takes the place of the active panel's status line
+and reads `Find: <text>`, then the number of the match and of all matches
+(`1/3`) or `no match`. Pasting opens it too, with the first pasted line. A
+transfer-only btty panel has no find line.
+
+The cursor goes to the first name that starts with the text, else to the
+first name that contains it. Matching ignores case. `*` stands for any run of
+characters and `?` for exactly one; every other character, `[` and `]`
+included, stands for itself. `..` is never a match.
+
+With the find line open:
+
+- Up and Down go to the previous and the next match, wrapping around.
+- Space types a space.
+- Backspace deletes the last character; on the last one it closes the line.
+  Ctrl-U clears the text and the line stays open.
+- Enter closes the line and, when the text matches, opens the directory on
+  the cursor row. On a file nothing opens.
+- Esc closes the line, and the cursor stays on the match.
+- Any other key closes the line and does its own job: for example Insert or
+  Ctrl-T selects the match and moves down, Tab switches to the other panel,
+  and the F-keys work as usual. Shift, Control, Option or Command pressed on
+  its own does not close the line.
+
+Text that contains `/`, is exactly `~`, or starts with `local:` or `btty:` is
+a path: the line reads `Go to: <text>`, and Enter goes there.
+
+- `/tmp` is absolute. `Sub/` and `../x` are taken from the panel's directory.
+- `~` and `~/x` are in the home directory of the panel's store: your home
+  directory on a local panel, the remote home on a btty panel.
+- `KIND:PATH`, such as `btty:/x` or `local:/tmp`, goes there as F9 does.
+- Write `./btty:x` for a local name that starts with `btty:`.
+- `~x`, `.` and `..` are searches; type `../` to go up.
+
+The path of a file opens its directory with the cursor on the file. Once the
+panel is there, the line closes. A path that does not exist shows one error,
+and the line stays open with your text.
+
+In a terminal that uses the kitty keyboard protocol but does not send the
+text of a key, Shift with a punctuation key (such as `*` or `?`) and Space do
+not type into the find line.
+
+### While a panel is loading
+
+While a panel is loading a listing, its status line reads `Loading…` (an
+open find line ends in `· loading…`). Until the active panel's listing
+arrives only Tab, Shift+Tab and quit (F10, Esc 0, Option-0, Ctrl-Q) work, and
+Ctrl-P still opens the command palette. Every other key, a click on another
+footer key, a paste and a click on the loading panel's rows are ignored:
+typed characters are dropped, not saved for later. The other panel, once
+listed, works as usual.
+
 ### Esc and Option with a digit
 
 If your F-keys do not reach the terminal (for example because they act as
 media keys), use one of these instead. Each works on the main screen:
 
-- Esc, then the digit: Esc 4 is F4, Esc 5 is F5, and so on to Esc 9 for F9,
+- Esc, then the digit: Esc 3 is F3, Esc 4 is F4, and so on to Esc 9 for F9,
   and Esc 0 is F10. You can type it slowly or quickly.
-- Option with the digit, on a US keyboard layout: Option-4 to Option-9 act as
-  F4 to F9 and Option-0 as F10. twinfm reads the character Option types
-  (`¢ ∞ § ¶ • ª º`) as the digit. In a dialog's text field these characters
-  are typed as text.
+- Option with the digit, on a US keyboard layout: Option-3 to Option-9 act as
+  F3 to F9 and Option-0 as F10. twinfm reads the character Option types
+  (`£ ¢ ∞ § ¶ • ª º`) as the digit. In a dialog's text field these characters
+  are typed as text. They never open or type into the find line.
 
 ### macOS Terminal.app and Shift-F6
 
@@ -333,6 +392,19 @@ local panel Ctrl-R simply lists the directory again.
 The checks before an operation (does the destination exist?) always ask the
 remote and never use the cache.
 
+## Viewing files (F3)
+
+F3 shows the file on the cursor row of a local panel with `more`, run as
+`more` followed by the file's absolute path. twinfm is suspended until `more`
+exits, then lists the panel again with the cursor on the file. F3 is not in
+the footer, which has no room for it in 80 columns.
+
+F3 views local files only. On a btty panel it says so; copy the file to a
+local panel to view it. On a directory it shows a warning. If `more` cannot
+start you get an error, and a non-zero exit status gives a warning.
+Esc 3 and Option-3 work as F3. On a Mac, F3 often opens Mission Control
+instead; use Esc 3 or Option-3 there.
+
 ## Editing files (F4)
 
 F4 opens the file on the cursor row of a local panel in an editor: `$VISUAL`
@@ -345,6 +417,43 @@ F4 edits local files only. On a btty panel it says so; copy the file to a
 local panel to edit it. On a directory it shows a warning. If the editor
 cannot start you get an error, and a non-zero exit status gives a warning.
 Esc 4 and Option-4 work as F4.
+
+## The shell (Ctrl-O)
+
+Ctrl-O hides the panels and shows a local shell in the terminal, as Midnight
+Commander does. Ctrl-O in the shell brings the panels back. The shell stays
+alive in the background, so the next Ctrl-O returns to it as you left it.
+Output it writes while hidden is shown then; after 1 MiB of it the shell
+waits until you look.
+
+The shell is `$SHELL -i`, else your login shell from the password database,
+else `/bin/sh -i`. It is always a local shell, never a btty one. It starts at
+the first Ctrl-O, in the active panel's directory when that panel is local,
+else in the other panel's when that one is local, else in twinfm's working
+directory.
+
+- At each Ctrl-O, when the shell is idle at an empty prompt in another
+  directory, twinfm types ` cd -- <directory>` into it to move it to the
+  active local panel's directory. This works with sh, bash, zsh, ksh, dash
+  and fish. The command is visible, and it stays out of the shell's history
+  only if the shell ignores lines that start with a space (bash
+  `ignorespace`, zsh `HIST_IGNORE_SPACE`). While a command runs, or a line is
+  half typed, the shell is not moved.
+- After a `cd` in the shell, Ctrl-O takes a local active panel to the
+  shell's directory.
+- With a btty panel active you get the same local shell, without moving it
+  or the panel.
+- If the shell exits (for example after `exit`), the panels come back with a
+  notice, and the next Ctrl-O starts a new shell.
+- While a command runs in the shell, quitting twinfm asks "A command is still
+  running in the shell. Quit anyway?" first. Quitting ends the shell and the
+  command.
+- Ctrl-O always switches back to the panels, so programs in the shell never
+  receive it.
+- A full-screen program in the shell (such as `vim` or `less`) gets its
+  alternate screen and bracketed paste mode back at the next Ctrl-O and is
+  asked to redraw. Its mouse mode is not restored.
+- Ctrl-O needs pseudo-terminals, so it does not work on Windows.
 
 ## Risks
 
@@ -377,8 +486,9 @@ Limitations of the btty side:
 - In archive mode, one file that pack cannot read (for example mode 000)
   fails the whole batch: nothing of it is transferred, and a move deletes no
   source. Uncheck Archive to transfer the readable items file by file.
-- F4 blocks twinfm while the editor runs. Background operations carry on, and
-  their questions wait until the editor exits.
+- F3, F4 and the Ctrl-O shell block twinfm while the viewer, the editor or
+  the shell has the terminal. Background operations carry on, and their
+  questions wait until the panels are back.
 
 ## Development
 

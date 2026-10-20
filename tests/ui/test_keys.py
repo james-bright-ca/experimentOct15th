@@ -11,6 +11,7 @@ import pytest
 from tests.ui.conftest import Tree
 from tests.ui.support import (
     SIZE,
+    FakeCommand,
     RecordingLocal,
     StubEngine,
     dialog_text,
@@ -83,16 +84,48 @@ async def test_alt_digit_opens_what_the_f_key_opens(
         assert _what_opened(app) == by_f_key
 
 
+@pytest.mark.parametrize("keys", [("escape", "3"), ("alt+3",)], ids=["Esc-then-3", "Alt-3"])
+async def test_escape_3_and_alt_3_view_what_f3_views(
+    tree: Tree, local: RecordingLocal, engine: StubEngine, keys: tuple[str, ...]
+) -> None:
+    """F3 opens no dialog: it hands the file to the viewer, so the viewer's
+    calls are compared instead of the screen."""
+    viewer = FakeCommand()
+    app = make_app((local, tree.L), (local, tree.R), engine, run_viewer=viewer)
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot)
+        await move_to(pilot, app.left_panel, "A.txt")
+        await pilot.press("f3")
+        await settle(pilot)
+        by_f_key = list(viewer.calls)
+        assert by_f_key == [["more", f"{tree.L}/A.txt"]]
+
+        await pilot.press(*keys)
+        await settle(pilot)
+
+        assert viewer.calls == by_f_key * 2
+        assert app.screen is app.main
+        assert engine.calls == []
+
+
 async def test_escape_then_other_key_cancels_the_prefix(
     tree: Tree, local: RecordingLocal, engine: StubEngine
 ) -> None:
+    """Down after Esc ends the prefix, so the 5 that follows is the plain
+    character 5, not F5: it opens the find line, and no dialog opens."""
     app = make_app((local, tree.L), (local, tree.R), engine)
     async with app.run_test(size=SIZE) as pilot:
         await settle(pilot)
+        panel = app.left_panel
+        assert not any("5" in name for name in panel.names), "precondition: no listed name contains 5"
         await pilot.press("escape", "down", "5")
         await pilot.pause()
-        assert app.screen is app.main
-        assert app.left_panel.cursor_name == app.left_panel.names[1]
+        assert app.screen is app.main, f"the 5 after Esc, Down opened {type(app.screen).__name__}"
+        assert panel.finding and panel.find_text == "5"
+        assert str(panel.query_one("#find").content) == "Find: 5 no match"
+        # No match: the cursor stays where Down put it.
+        assert panel.cursor_name == panel.names[1]
+        assert engine.calls == []
 
 
 async def test_f5_through_escape_5_runs_the_same_copy(
