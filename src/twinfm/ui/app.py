@@ -13,14 +13,19 @@ digit).
 
 Typing any other character (not Space) opens the active panel's find line:
 the cursor goes to the first name that matches, Up / Down step through the
-matches, Enter closes the line and opens a matching directory, and Esc or
-any other key closes it. Text with a ``/``, ``~`` alone or ``KIND:`` is a
-path: Enter goes there.
-A modifier key pressed on its own (Shift, Control, Option, Command, Caps
-Lock) does not close the line; it waits for the key the modifier goes with.
+matches, and Enter closes the line and opens a matching directory. Text with
+a ``/``, ``~`` alone or ``KIND:`` is a path: Enter goes there. While the line
+is open, Esc closes it, Space types a space, Backspace and Ctrl-U edit it, a
+modifier key pressed on its own (Shift, Control, Option, Command, Caps Lock)
+leaves it open, waiting for the key the modifier goes with, and any other
+key closes it and does its own job. Keys from a kitty-protocol terminal that
+leaves out their text type too: Space, a punctuation key, and Shift with a
+letter, digit or punctuation key; Shift is read as on a US layout (Shift+/ is
+``?``, Shift+2 is ``@``), whatever the keyboard's layout.
 
 F3 (or Esc then 3, or Option-3) views the file on the cursor row of a local
-panel with more; the footer has no room for it in 80 columns. F4 (or
+panel with ``command`` from the config file's ``[viewer]`` table, else
+$PAGER, else ``less -R``, else more when less is not installed. F4 (or
 Esc then 4, or Option-4) edits that file in $VISUAL, else $EDITOR, else vim.
 The app is suspended until the viewer or the editor exits. Ctrl-R reloads
 past any cached listing: a backend may cache listings (btty does) and keeps
@@ -53,6 +58,7 @@ import importlib
 import os
 import posixpath
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -125,7 +131,8 @@ _MODIFIER_KEYS = frozenset(
 # A kitty terminal that leaves out the text field sends an unmodified key as
 # ESC[<code>u. Textual 8.2.8 names a punctuation key after its character
 # (slash, full_stop, grave_accent, ...) and gives it no character: the
-# character each such name types. Space keeps its own handling.
+# character each such name types. Space, and Shift with a key, are read in
+# _typed and _SHIFTED_KEYS.
 _PUNCTUATION_KEYS = {
     "exclamation_mark": "!", "quotation_mark": '"', "number_sign": "#", "dollar_sign": "$",
     "percent_sign": "%", "ampersand": "&", "apostrophe": "'", "left_parenthesis": "(",
@@ -135,6 +142,17 @@ _PUNCTUATION_KEYS = {
     "left_square_bracket": "[", "backslash": "\\", "right_square_bracket": "]",
     "circumflex_accent": "^", "underscore": "_", "grave_accent": "`",
     "left_curly_bracket": "{", "vertical_line": "|", "right_curly_bracket": "}", "tilde": "~",
+}
+
+# Shift with a key arrives the same way as shift+<the unshifted key's name>,
+# with no character (ESC[47;2u is shift+slash). The terminal does not say
+# what the layout prints, so this is what Shift gives on a US layout.
+_SHIFTED_KEYS = {
+    "grave_accent": "~", "1": "!", "2": "@", "3": "#", "4": "$", "5": "%", "6": "^",
+    "7": "&", "8": "*", "9": "(", "0": ")", "minus": "_", "equals_sign": "+",
+    "left_square_bracket": "{", "right_square_bracket": "}", "backslash": "|",
+    "semicolon": ":", "apostrophe": '"', "comma": "<", "full_stop": ">", "slash": "?",
+    "space": " ",
 }
 
 
@@ -151,9 +169,14 @@ def _typed(event: events.Key) -> str | None:
     modifiers, _, name = event.key.rpartition("+")
     if event.character is None and modifiers == "shift" and len(name) == 1 and "a" <= name <= "z":
         return name.upper()
-    # ESC[47u, an unmodified "/" without the text field, is slash with no character.
+    if event.character is None and modifiers == "shift" and name in _SHIFTED_KEYS:
+        return _SHIFTED_KEYS[name]
+    # ESC[47u, an unmodified "/" without the text field, is slash with no
+    # character; ESC[32u is space with none.
     if event.character is None and event.key in _PUNCTUATION_KEYS:
         return _PUNCTUATION_KEYS[event.key]
+    if event.character is None and event.key == "space":
+        return " "
     if not event.is_printable or not event.character:
         return None
     if any(modifier != "shift" for modifier in event.key.split("+")[:-1]):
@@ -170,6 +193,21 @@ def _editor_argv(path: str) -> list[str]:
     except ValueError:  # an unclosed quote
         command = []
     return [*(command or ["vim"]), path]
+
+
+def _viewer_argv(setting: str | None, path: str) -> list[str]:
+    """``setting`` (``[viewer] command``), else $PAGER when it is non-empty
+    and parses, else ``less -R`` when less is on PATH, else more; split as a
+    shell would, then ``path``."""
+    if setting is not None:
+        return [*shlex.split(setting), path]
+    try:
+        pager = shlex.split(os.environ.get("PAGER", ""))
+    except ValueError:  # an unclosed quote
+        pager = []
+    if pager:
+        return [*pager, path]
+    return ["less", "-R", path] if shutil.which("less") else ["more", path]
 
 
 def _archive_applies(src: Backend, dst: Backend, items: Sequence[Entry]) -> bool:
@@ -195,22 +233,27 @@ class FileManagerScreen(Screen[None]):
     FileManagerScreen Footer FooterKey:last-of-type {
         margin-right: 0;
     }
+    /* Midnight Commander's "3View": no space between key and description,
+       so that all eleven keys fit 80 columns. */
+    FileManagerScreen Footer FooterKey.-compact .footer-key--description {
+        padding: 0;
+    }
     """
 
     BINDINGS = [
-        # Not in the footer, which has no room for it at 80 columns.
-        Binding("f3", "app.view", "View", key_display="F3", show=False),
-        Binding("f4", "app.edit", "Edit", key_display="F4"),
-        Binding("f5", "app.copy", "Copy", key_display="F5"),
-        Binding("f6", "app.move", "Move", key_display="F6"),
+        # The footer shows them in this order, after the panel's ^R Refresh.
+        Binding("ctrl+o", "app.shell", "Shell", key_display="^O"),
+        Binding("f3", "app.view", "View", key_display="3"),
+        Binding("f4", "app.edit", "Edit", key_display="4"),
+        Binding("f5", "app.copy", "Copy", key_display="5"),
+        Binding("f6", "app.move", "Move", key_display="6"),
         # The footer shows one key per action: Ctrl-N, which every terminal sends.
         Binding("shift+f6", "app.rename", "Rename", show=False),
         Binding("ctrl+n", "app.rename", "Rename", key_display="^N"),
-        Binding("f7", "app.mkdir", "Mkdir", key_display="F7"),
-        Binding("f8", "app.delete", "Del", key_display="F8"),
-        Binding("f9", "app.connect", "Connect", key_display="F9"),
-        Binding("f10", "app.quit", "Quit", key_display="F10"),
-        Binding("ctrl+o", "app.shell", "Shell", show=False),
+        Binding("f7", "app.mkdir", "Mkdir", key_display="7"),
+        Binding("f8", "app.delete", "Del", key_display="8"),
+        Binding("f9", "app.connect", "Connect", key_display="9"),
+        Binding("f10", "app.quit", "Quit", key_display="10"),
         *(Binding(f"alt+{digit}", f"app.{action}", show=False) for digit, action in _ESC_DIGITS.items()),
     ]
 
@@ -420,8 +463,10 @@ class TwinFM(App[None]):
         self.notify(f"{what} is not available in transfer-only mode", severity="warning")
 
     def action_view(self) -> None:
-        """F3: view the file on the cursor row of a local panel with more,
-        then list the panel again with the cursor on it."""
+        """F3: view the file on the cursor row of a local panel with the
+        viewer (``[viewer] command``, else $PAGER, else ``less -R``, else
+        ``more``), then list the panel again with the cursor on it. A viewer
+        that cannot start is reported, never replaced by another."""
         panel = self.active_panel
         if not isinstance(panel.backend, LocalBackend):
             self.notify(
@@ -435,15 +480,19 @@ class TwinFM(App[None]):
         if entry.kind != "file" and not (entry.kind == "symlink" and entry.target_kind == "file"):
             self.notify(f'"{entry.name}" is not a file', title="View", severity="warning", markup=False)
             return
+        argv = _viewer_argv(self.settings.viewer_command, entry.path)
+        program = argv[0]
         try:
-            status = self._run_viewer(["more", entry.path])
+            status = self._run_viewer(argv)
         except SuspendNotSupported:
             self.notify("This terminal cannot be handed over to a viewer", title="View")
         except OSError as e:
-            self.notify(str(e), title="Cannot start more", severity="error", markup=False)
+            self.notify(str(e), title=f"Cannot start {program}", severity="error", markup=False)
         else:
             if status != 0:
-                self.notify(f"more exited with status {status}", title="View", severity="warning")
+                self.notify(
+                    f"{program} exited with status {status}", title="View", severity="warning", markup=False
+                )
         self._refresh([panel.backend], panel, entry.name)
 
     def action_edit(self) -> None:

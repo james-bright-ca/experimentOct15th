@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from textual.widgets import Footer
+from textual.widgets._footer import FooterKey
 
 import twinfm.ui.shell as shell_module
 from tests.ui.conftest import Tree, send_bytes
@@ -153,6 +155,34 @@ async def test_ctrl_o_from_terminal_bytes_runs_the_shell(tree: Tree, local: Reco
         names = await send_bytes(pilot, data)
         await settle(pilot)
         assert runner.calls == [(tree.L, tree.L)], f"{data!r} parsed as {names}"
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+async def test_clicking_the_footers_shell_key_runs_the_shell_as_ctrl_o_does(
+    tree: Tree, local: RecordingLocal, side: str
+) -> None:
+    """The footer's ``^OShell``: one click, one visit, started in and
+    following the active panel's directory, as Ctrl-O's."""
+    runner = FakeShellRunner()
+    app = shell_app((local, tree.L), (local, tree.R), runner)
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot)
+        if side == "right":
+            await pilot.press("tab")
+            await pilot.pause()
+        where = tree.L if side == "left" else tree.R
+        await pilot.press("ctrl+o")
+        await settle(pilot)
+        assert runner.calls == [(where, where)]
+
+        (key,) = [k for k in app.main.query_one(Footer).query(FooterKey) if k.key == "ctrl+o"]
+        assert key.render().plain == "^OShell"
+        await pilot.click(key)
+        await settle(pilot)
+
+        assert runner.calls == [(where, where)] * 2
+        assert app.screen is app.main
+        assert_alive(app)
 
 
 # -- after the visit --------------------------------------------------------------------

@@ -51,7 +51,14 @@ error message and exit status 2.
 
 ## Keys
 
-The footer shows the main keys. You can also click them.
+The footer shows the main keys in Midnight Commander's style, a digit for its
+F-key and `^` for Ctrl:
+
+```
+^RRefresh ^OShell 3View 4Edit 5Copy 6Move ^NRename 7Mkdir 8Del 9Connect 10Quit
+```
+
+You can also click them.
 
 | Key | Action |
 |---|---|
@@ -60,7 +67,7 @@ The footer shows the main keys. You can also click them.
 | Tab | switch to the other panel |
 | Space, Insert, Ctrl-T | select or deselect the cursor row and move down (`..` cannot be selected) |
 | a letter, digit or other printable character (not Space) | find a name in the panel, or type a path to go to (see [Find and go to](#find-and-go-to)) |
-| F3 | view the file on the cursor row with `more` (local panels only, not in the footer, see [Viewing files](#viewing-files-f3)) |
+| F3 | view the file on the cursor row (local panels only, see [Viewing files](#viewing-files-f3)) |
 | F4 | edit the file on the cursor row (local panels only, see [Editing files](#editing-files-f4)) |
 | F5 | copy the selection, or the cursor row, to the other panel |
 | F6 | move the selection, or the cursor row, to the other panel |
@@ -75,6 +82,11 @@ The footer shows the main keys. You can also click them.
 The status line under each panel shows the number of items, or the number of
 selected items and the total size of the selected files. While the panel is
 loading it reads `Loading…` (see [While a panel is loading](#while-a-panel-is-loading)).
+
+A name wider than the Name column makes the listing scroll sideways, until the
+panel lists a directory whose names fit. The Size and Modified columns keep
+their width, so in a narrow terminal ordinary names scroll too: at 80 columns
+a name longer than about 8 characters, at 100 columns about 18.
 
 F5 and F6 ask for the target, prefilled with the other panel's directory. An
 existing directory receives the items. With one item, a path that does not
@@ -129,8 +141,9 @@ panel is there, the line closes. A path that does not exist shows one error,
 and the line stays open with your text.
 
 In a terminal that uses the kitty keyboard protocol but does not send the
-text of a key, Shift with a punctuation key (such as `*` or `?`) and Space do
-not type into the find line.
+text of a key, Shift with a digit or punctuation key types into the find line
+the character it gives on a US keyboard layout (Shift+/ is `?`, Shift+2 is
+`@`), whatever your layout is. Space types a space into an open find line.
 
 ### While a panel is loading
 
@@ -186,8 +199,8 @@ Action "Send Text:" `\033[17;2~`. Press Esc in the text field to type
 
 twinfm reads one TOML file: the `--config PATH` file if given, else
 `$TWINFM_CONFIG` if set, else `~/.config/twinfm/config.toml`. A missing file
-means the defaults. The file holds one `[btty]` table. Every key is optional,
-and the values below are the defaults:
+means the defaults. The file holds a `[btty]` table and a `[viewer]` table.
+Every key is optional, and the `[btty]` values below are the defaults:
 
 ```toml
 [btty]
@@ -210,8 +223,20 @@ archive_max_bytes = 268435456        # 256 MiB; a larger batch is transferred pe
 | `archive_timeout` | Seconds passed to `btty --timeout` for the archive commands (pack, unpack, merge). |
 | `archive_max_bytes` | The largest batch moved as one archive, in bytes. |
 
-Other top-level tables are ignored. An unknown key in `[btty]`, or a value of
-the wrong type, is an error that names the file and the key.
+`[viewer]` has one key, `command`: the viewer F3 runs, with its arguments,
+split as a shell would split it. It has no default; without it F3 uses
+`$PAGER`, else `less -R` (see [Viewing files](#viewing-files-f3)). For
+example:
+
+```toml
+[viewer]
+command = "bat --paging=always"
+```
+
+Other top-level tables are ignored. An unknown key in `[btty]` or `[viewer]`,
+or a value of the wrong type, is an error that names the file and the key.
+`command` in `[viewer]` must be a command of at least one word, without an
+unclosed quote.
 
 ### Command-line flags
 
@@ -394,14 +419,19 @@ remote and never use the cache.
 
 ## Viewing files (F3)
 
-F3 shows the file on the cursor row of a local panel with `more`, run as
-`more` followed by the file's absolute path. twinfm is suspended until `more`
-exits, then lists the panel again with the cursor on the file. F3 is not in
-the footer, which has no room for it in 80 columns.
+F3 shows the file on the cursor row of a local panel in a viewer: `command`
+in the config file's `[viewer]` table (see [Config file](#config-file)) if
+set, else `$PAGER` (unless it is empty or has an unclosed quote), else
+`less -R`, else `more` when `less` is not on PATH. The command is split as a
+shell would split it (so `PAGER="less -FRX"` works) and the file's absolute
+path is added as the last argument; no shell is involved. twinfm is suspended
+until the viewer exits, then lists the panel again with the cursor on the
+file.
 
 F3 views local files only. On a btty panel it says so; copy the file to a
-local panel to view it. On a directory it shows a warning. If `more` cannot
-start you get an error, and a non-zero exit status gives a warning.
+local panel to view it. On a directory it shows a warning. If the viewer
+cannot start you get an error naming it, and no other viewer is tried. A
+non-zero exit status gives a warning.
 Esc 3 and Option-3 work as F3. On a Mac, F3 often opens Mission Control
 instead; use Esc 3 or Option-3 there.
 
