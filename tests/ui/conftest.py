@@ -9,10 +9,14 @@ from tests/ui/support.py, plus
   ``¢`` a fast ESC+4 or Option-4 becomes);
 * the autouse ``shell_guard``: $SHELL is the fake shell (tests/ui/fake_shell.py)
   for every test, so a LocalShell (Ctrl-O) can never start the user's real
-  shell or read its rc files."""
+  shell or read its rc files;
+* the autouse ``viewer_env``: F3's choice of viewer never depends on the
+  developer's environment ($PAGER unset, ``less`` found unless a test says
+  otherwise)."""
 
 from __future__ import annotations
 
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,6 +72,39 @@ def shell_guard(fake_shell_path: str, monkeypatch: pytest.MonkeyPatch) -> str:
         f"shell guard: default_shell() is {resolved}, not the fake shell {fake_shell_path}"
     )
     return fake_shell_path
+
+
+DEFAULT_VIEWER = ["less", "-R"]
+"""F3's viewer under ``viewer_env``'s defaults: no setting, no $PAGER, less on PATH."""
+
+
+@dataclass
+class ViewerEnv:
+    """What F3's choice of viewer sees. ``less``: whether the app's lookup of
+    ``less`` finds it."""
+
+    less: bool = True
+
+
+@pytest.fixture(autouse=True)
+def viewer_env(monkeypatch: pytest.MonkeyPatch) -> ViewerEnv:
+    """Autouse: $PAGER is unset, and ``shutil.which("less")`` - the lookup
+    twinfm.ui.app makes through its ``shutil`` module, which is this one -
+    answers from ``ViewerEnv.less``: found by default, so F3's default viewer
+    is ``DEFAULT_VIEWER``. Every other name goes to the real ``shutil.which``
+    (the shell guard and the btty guard rely on it). A test sets $PAGER itself
+    with ``monkeypatch.setenv``."""
+    env = ViewerEnv()
+    monkeypatch.delenv("PAGER", raising=False)
+    real_which = shutil.which
+
+    def which(cmd: Any, *args: Any, **kwargs: Any) -> str | None:
+        if cmd == "less":
+            return "/usr/bin/less" if env.less else None
+        return real_which(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "which", which)
+    return env
 
 
 @pytest.fixture

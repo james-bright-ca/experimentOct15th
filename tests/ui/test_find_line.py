@@ -27,10 +27,11 @@ from textual.pilot import Pilot
 from textual.widgets import Footer
 from textual.widgets._footer import FooterKey
 
-from tests.ui.conftest import LEFT_ORDER, Tree, parse_keys, send_bytes
+from tests.ui.conftest import DEFAULT_VIEWER, LEFT_ORDER, Tree, parse_keys, send_bytes
 from tests.ui.support import (
     SIZE,
     TRANSFER_ONLY,
+    FakeCommand,
     FakeConnector,
     Notes,
     RecordingLocal,
@@ -1595,3 +1596,280 @@ async def test_punctuation_with_alt_ctrl_or_super_without_text_is_never_typed(
         assert_closed(panel)
         assert panel.path == tree.L
         assert app.screen is app.main
+
+
+# -- Shift and Space without the text field ------------------------------------------------------
+#
+# Promised to the user: in a kitty-protocol terminal that sends keys without
+# their text, Shift+punctuation (and Shift+digit) and Space type into the find
+# line. Textual 8.2.8 reads ESC[47;2u as shift+slash with no character: the
+# terminal does not say what the layout prints, so Shift is read as on a US
+# layout. The legacy and with-text forms carry the real character.
+
+SHIFTED = {
+    "grave_accent": (96, "~"),
+    "1": (49, "!"),
+    "2": (50, "@"),
+    "3": (51, "#"),
+    "4": (52, "$"),
+    "5": (53, "%"),
+    "6": (54, "^"),
+    "7": (55, "&"),
+    "8": (56, "*"),
+    "9": (57, "("),
+    "0": (48, ")"),
+    "minus": (45, "_"),
+    "equals_sign": (61, "+"),
+    "left_square_bracket": (91, "{"),
+    "right_square_bracket": (93, "}"),
+    "backslash": (92, "|"),
+    "semicolon": (59, ":"),
+    "apostrophe": (39, '"'),
+    "comma": (44, "<"),
+    "full_stop": (46, ">"),
+    "slash": (47, "?"),
+}
+"""The 21 keys whose Shift form types a US-layout character: Textual's name
+for the unshifted key -> (its key code, the character Shift gives)."""
+
+SPACE_NO_TEXT = "\x1b[32u"
+SHIFT_SPACE_NO_TEXT = "\x1b[32;2u"
+
+
+def _shifted_no_text(name: str) -> str:
+    """Shift+``name`` in CSI-u form without the text field."""
+    return f"\x1b[{SHIFTED[name][0]};2u"
+
+
+def test_shifted_keys_and_space_without_text_parse_as_the_tests_below_assume() -> None:
+    def parsed(data: str) -> list[tuple[str, str | None]]:
+        return [(k.key, k.character) for k in parse_keys(data)]
+
+    assert {name: parsed(_shifted_no_text(name)) for name in SHIFTED} == {
+        name: [(f"shift+{name}", None)] for name in SHIFTED
+    }
+    assert len(SHIFTED) == 21
+    assert parsed(SPACE_NO_TEXT) == [("space", None)]
+    assert parsed(SHIFT_SPACE_NO_TEXT) == [("shift+space", None)]
+    assert parsed("\x1b[47;3u") == [("alt+slash", None)]
+    assert parsed("\x1b[50;5u") == [("ctrl+2", None)]
+
+
+@pytest.mark.parametrize(
+    ("data", "typed"),
+    [("\x1b[47;2u", "?"), ("\x1b[50;2u", "@"), ("\x1b[45;2u", "_")],
+    ids=["shift-slash", "shift-2", "shift-minus"],
+)
+async def test_a_shifted_key_without_text_extends_an_open_line(
+    tree: Tree, local: RecordingLocal, engine: StubEngine, size: tuple[int, int], data: str, typed: str
+) -> None:
+    app = make_app((local, tree.L), (local, tree.R), engine)
+    async with app.run_test(size=size) as pilot:
+        await settle(pilot)
+        panel = app.left_panel
+        await type_text(pilot, "/")
+        assert_open(panel, "/", "Go to: /")
+
+        names = await send_bytes(pilot, data)
+
+        assert_open(panel, "/" + typed, f"Go to: /{typed}")
+        assert len(names) == 1 and names[0].startswith("shift+"), names
+        assert panel.path == tree.L
+        assert app.screen is app.main
+
+
+async def test_each_shifted_key_without_text_types_its_us_character_into_an_open_line(
+    tree: Tree, local: RecordingLocal, engine: StubEngine
+) -> None:
+    """Each of the 21 keys, after "b": the line stays open, holding "b" and
+    the character; no selection, no move to another directory."""
+    app = make_app((local, tree.L), (local, tree.R), engine)
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot)
+        panel = app.left_panel
+        failed = []
+        for name, (_, character) in SHIFTED.items():
+            await type_text(pilot, "b")
+            names = await send_bytes(pilot, _shifted_no_text(name))
+            if not (panel.finding and panel.find_text == "b" + character):
+                failed.append((name, character, names, panel.finding, panel.find_text))
+            if panel.finding:
+                panel.find_close()
+                await pilot.pause()
+        assert failed == [], f"{len(failed)} shifted key(s) did not type their character: {failed}"
+        assert panel.selected == set()
+        assert panel.path == tree.L
+        assert app.screen is app.main
+        assert engine.calls == []
+        assert_alive(app)
+
+
+async def test_each_shifted_key_without_text_opens_the_line_holding_its_us_character(
+    tree: Tree, local: RecordingLocal, engine: StubEngine
+) -> None:
+    app = make_app((local, tree.L), (local, tree.R), engine)
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot)
+        panel = app.left_panel
+        failed = []
+        for name, (_, character) in SHIFTED.items():
+            assert_closed(panel)
+            names = await send_bytes(pilot, _shifted_no_text(name))
+            if not (panel.finding and panel.find_text == character):
+                failed.append((name, character, names, panel.finding, panel.find_text))
+            if panel.finding:
+                panel.find_close()
+                await pilot.pause()
+        assert failed == [], f"{len(failed)} shifted key(s) did not open the line as their character: {failed}"
+        assert panel.selected == set()
+        assert panel.path == tree.L
+        assert app.screen is app.main
+        assert engine.calls == []
+        assert_alive(app)
+
+
+@pytest.mark.parametrize("data", [SPACE_NO_TEXT, SHIFT_SPACE_NO_TEXT], ids=["space", "shift-space"])
+async def test_space_without_text_types_a_space_into_an_open_line_and_selects_nothing(
+    tree: Tree, local: RecordingLocal, engine: StubEngine, size: tuple[int, int], data: str
+) -> None:
+    (tree.left / "big file.txt").write_bytes(b"big")
+    app = make_app((local, tree.L), (local, tree.R), engine)
+    async with app.run_test(size=size) as pilot:
+        await settle(pilot)
+        panel = app.left_panel
+        await type_text(pilot, "g")
+        assert_open(panel, "g")
+
+        await send_bytes(pilot, data)
+        assert_open(panel, "g ")
+        assert panel.selected == set()
+
+        await type_text(pilot, "f")
+        assert_open(panel, "g f", "Find: g f 1/1")
+        assert panel.cursor_name == "big file.txt"
+        assert panel.selected == set()
+
+
+async def test_space_without_text_with_the_line_closed_selects_moves_down_and_opens_nothing(
+    tree: Tree, local: RecordingLocal, engine: StubEngine, size: tuple[int, int]
+) -> None:
+    app = make_app((local, tree.L), (local, tree.R), engine)
+    async with app.run_test(size=size) as pilot:
+        await settle(pilot)
+        panel = app.left_panel
+        await move_to(pilot, panel, "A.txt")
+
+        names = await send_bytes(pilot, SPACE_NO_TEXT)
+
+        assert names == ["space"], names
+        assert panel.selected == {"A.txt"}
+        assert panel.cursor_name == "b.txt"
+        assert_closed(panel)
+
+
+async def test_shift_space_without_text_with_the_line_closed_never_opens_it(
+    tree: Tree, local: RecordingLocal, engine: StubEngine, size: tuple[int, int]
+) -> None:
+    """Space never opens the line, with Shift too."""
+    app = make_app((local, tree.L), (local, tree.R), engine)
+    async with app.run_test(size=size) as pilot:
+        await settle(pilot)
+        panel = app.left_panel
+        await move_to(pilot, panel, "A.txt")
+        await send_bytes(pilot, SHIFT_SPACE_NO_TEXT)
+        assert_closed(panel)
+        assert panel.path == tree.L
+        assert app.screen is app.main
+
+
+MODIFIED_SHIFTED = {
+    "alt+slash": "\x1b[47;3u",
+    "ctrl+2": "\x1b[50;5u",
+    "alt+shift+slash": "\x1b[47;4u",
+    "ctrl+shift+2": "\x1b[50;6u",
+    "shift+super+slash": "\x1b[47;10u",
+    "ctrl+space": "\x1b[32;5u",
+    "alt+space": "\x1b[32;3u",
+}
+"""A key of SHIFTED or Space with Alt, Ctrl or Super (Shift or not), in
+CSI-u form without the text field, keyed by the name Textual 8.2.8 parses it as."""
+
+
+@pytest.mark.parametrize("name", list(MODIFIED_SHIFTED))
+async def test_a_shifted_key_or_space_with_alt_ctrl_or_super_without_text_is_never_typed(
+    tree: Tree, local: RecordingLocal, engine: StubEngine, name: str
+) -> None:
+    """With the line open it is a key the line does not use: the line closes
+    without the character. With the line closed it opens nothing."""
+    data = MODIFIED_SHIFTED[name]
+    app = make_app((local, tree.L), (local, tree.R), engine)
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot)
+        panel = app.left_panel
+        await type_text(pilot, "b")
+        assert_open(panel, "b", "Find: b 2/2")
+
+        names = await send_bytes(pilot, data)
+
+        assert names == [name], f"{data!r} parsed as {names}"
+        assert_closed(panel)
+        assert panel.path == tree.L
+        assert app.screen is app.main
+
+        await send_bytes(pilot, data)
+        assert_closed(panel)
+        assert panel.path == tree.L
+
+
+WITH_TEXT = {
+    "us-shift-slash": ("\x1b[47;2;63u", "?"),
+    "us-shift-2": ("\x1b[50;2;64u", "@"),
+    "german-shift-7": ("\x1b[55;2;47u", "/"),
+}
+"""Shift+key in CSI-u form with the text field: the layout's own character,
+which is what is typed (on a German layout Shift+7 prints "/", not "&")."""
+
+
+@pytest.mark.parametrize("label", list(WITH_TEXT))
+async def test_a_shifted_key_with_its_text_types_that_text_not_the_us_character(
+    tree: Tree, local: RecordingLocal, engine: StubEngine, label: str
+) -> None:
+    data, typed = WITH_TEXT[label]
+    app = make_app((local, tree.L), (local, tree.R), engine)
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot)
+        panel = app.left_panel
+        names = await send_bytes(pilot, data)
+        assert panel.finding and panel.find_text == typed, (names, panel.find_text)
+        await send_bytes(pilot, data)
+        assert panel.finding and panel.find_text == typed * 2, (names, panel.find_text)
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    [("\x1b[27u", "\x1b[51u"), ("\x1b[51;3u",), ("£",)],
+    ids=["Esc-then-3", "Alt-3", "Option-3"],
+)
+async def test_esc_3_alt_3_and_option_3_still_view_while_shift_3_without_text_types_a_number_sign(
+    tree: Tree, local: RecordingLocal, engine: StubEngine, chunks: tuple[str, ...]
+) -> None:
+    """The F-key stand-ins are untouched by the Shift table: Esc then 3,
+    Alt-3 (both in CSI-u form without text) and Option-3's ``£`` view the
+    cursor file; Shift-3 without text types ``#`` and views nothing."""
+    viewer = FakeCommand()
+    app = make_app((local, tree.L), (local, tree.R), engine, run_viewer=viewer)
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot)
+        panel = app.left_panel
+        await move_to(pilot, panel, "b.txt")
+
+        names = await send_bytes(pilot, *chunks)
+        await settle(pilot)
+        assert viewer.calls == [[*DEFAULT_VIEWER, f"{tree.L}/b.txt"]], f"{chunks!r} parsed as {names}"
+        assert_closed(panel)
+
+        names = await send_bytes(pilot, "\x1b[51;2u")
+        await settle(pilot)
+        assert names == ["shift+3"], names
+        assert len(viewer.calls) == 1, "Shift-3 viewed the file"
+        assert_open(panel, "#", "Find: # no match")

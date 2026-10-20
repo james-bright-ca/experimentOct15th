@@ -1,6 +1,6 @@
 """Settings: defaults, an optional TOML config file, and command-line overrides.
 
-The config file holds one table::
+The config file holds two tables::
 
     [btty]
     home = "/mnt/home0/wst/workspaces"       # remote home directory (absolute)
@@ -11,15 +11,22 @@ The config file holds one table::
     archive_timeout = 900                    # seconds, btty --timeout for pack, unpack and merge
     archive_max_bytes = 268435456            # a larger batch is transferred per file
 
+    [viewer]
+    command = "less -R"                      # F3's viewer, split as a shell would
+
 Every key is optional. Other top-level tables are ignored.
-The values shown are the defaults: exec mode is on unless ``exec = false``,
-which leaves only single-file upload and download.
+The ``[btty]`` values shown are the defaults: exec mode is on unless
+``exec = false``, which leaves only single-file upload and download.
+``[viewer] command`` has no default: without it F3 runs $PAGER, else
+``less -R``, else ``more``. The file's path is always added as the last
+argument; no shell is involved.
 """
 
 from __future__ import annotations
 
 import os
 import posixpath
+import shlex
 import tomllib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -53,6 +60,18 @@ def _command(value: object) -> str:
     return value
 
 
+def _viewer_command(value: object) -> str | None:
+    if value is None:
+        return None
+    try:
+        words = shlex.split(value) if isinstance(value, str) else []
+    except ValueError:  # an unclosed quote
+        words = []
+    if not words:
+        raise ValueError(f"must be a command of at least one word, got {value!r}")
+    return value
+
+
 def _exec(value: object) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"must be true or false, got {value!r}")
@@ -79,17 +98,23 @@ _FIELDS: dict[str, Callable[[object], Any]] = {
     "remote_tmp": _remote_home,
     "btty_archive_timeout": _timeout,
     "archive_max_bytes": _byte_count,
+    "viewer_command": _viewer_command,
 }
 
-# config-file key in [btty] -> Settings field
+# config-file table -> its key -> Settings field
 _FILE_KEYS = {
-    "home": "remote_home",
-    "command": "btty_command",
-    "exec": "btty_exec",
-    "timeout": "btty_timeout",
-    "tmp": "remote_tmp",
-    "archive_timeout": "btty_archive_timeout",
-    "archive_max_bytes": "archive_max_bytes",
+    "btty": {
+        "home": "remote_home",
+        "command": "btty_command",
+        "exec": "btty_exec",
+        "timeout": "btty_timeout",
+        "tmp": "remote_tmp",
+        "archive_timeout": "btty_archive_timeout",
+        "archive_max_bytes": "archive_max_bytes",
+    },
+    "viewer": {
+        "command": "viewer_command",
+    },
 }
 
 
@@ -135,6 +160,11 @@ class Settings:
         size or the packed archive is larger, the batch is transferred per
         file instead. btty holds a whole transfer in memory, hence the
         default of 268435456 (256 MiB); ``archive_max_bytes`` in ``[btty]``.
+    viewer_command
+        The command F3 views a local file with, split as a shell would, the
+        file's absolute path added as its last argument. Default None: F3
+        runs $PAGER, else ``less -R``, else ``more``; ``command`` in
+        ``[viewer]``.
 
     Invalid values raise ValueError naming the field.
     """
@@ -146,6 +176,7 @@ class Settings:
     remote_tmp: str = "/tmp"
     btty_archive_timeout: int = 900
     archive_max_bytes: int = 268435456
+    viewer_command: str | None = None
 
     def __post_init__(self) -> None:
         for name, check in _FIELDS.items():
@@ -171,9 +202,9 @@ def load_settings(
     """Build Settings from defaults, the config file, then ``overrides``.
 
     The file is chosen by ``config_path(path)``; a missing file means
-    defaults. An unreadable or malformed file (bad TOML, ``btty`` not a table,
-    an unknown key in ``[btty]``, a value of the wrong type) raises
-    ConfigError naming the file. ``overrides`` (from command-line flags) maps
+    defaults. An unreadable or malformed file (bad TOML, ``btty`` or ``viewer``
+    not a table, an unknown key in ``[btty]`` or ``[viewer]``, a value of the
+    wrong type) raises ConfigError naming the file. ``overrides`` (from command-line flags) maps
     Settings field names to values and wins over the file; a None value means
     "not given". An unknown override name, or an invalid override value,
     raises ValueError.
@@ -189,19 +220,20 @@ def load_settings(
     except OSError as e:
         raise ConfigError(file, e.strerror or str(e)) from e
 
-    table = data.get("btty", {})
-    if not isinstance(table, dict):
-        raise ConfigError(file, "[btty] must be a table")
     values: dict[str, Any] = {}
-    for key, value in table.items():
-        name = _FILE_KEYS.get(key)
-        if name is None:
-            known = ", ".join(_FILE_KEYS)
-            raise ConfigError(file, f"unknown key {key!r} in [btty] (known: {known})")
-        try:
-            values[name] = _FIELDS[name](value)
-        except ValueError as e:
-            raise ConfigError(file, f"[btty] {key} {e}") from None
+    for section, keys in _FILE_KEYS.items():
+        table = data.get(section, {})
+        if not isinstance(table, dict):
+            raise ConfigError(file, f"[{section}] must be a table")
+        for key, value in table.items():
+            name = keys.get(key)
+            if name is None:
+                known = ", ".join(keys)
+                raise ConfigError(file, f"unknown key {key!r} in [{section}] (known: {known})")
+            try:
+                values[name] = _FIELDS[name](value)
+            except ValueError as e:
+                raise ConfigError(file, f"[{section}] {key} {e}") from None
 
     for name, value in (overrides or {}).items():
         if name not in _FIELDS:

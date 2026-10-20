@@ -480,8 +480,8 @@ async def test_footer_shows_f4_edit(tree: Tree, local: RecordingLocal, size: tup
         keys = [k for k in app.main.query_one(Footer).query(FooterKey) if k.key == "f4"]
         assert len(keys) == 1, [(k.key, k.description) for k in app.main.query_one(Footer).query(FooterKey)]
         key = keys[0]
-        assert (key.key_display, key.description) == ("F4", "Edit")
-        assert "F4" in key.render().plain and "Edit" in key.render().plain
+        assert (key.key_display, key.description) == ("4", "Edit")
+        assert key.render().plain == "4Edit"
         width, height = size
         assert 0 <= key.region.x and key.region.right <= width and key.region.y == height - 1, key.region
 

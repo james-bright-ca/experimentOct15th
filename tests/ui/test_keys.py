@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.ui.conftest import Tree
+from tests.ui.conftest import DEFAULT_VIEWER, Tree
 from tests.ui.support import (
     SIZE,
     FakeCommand,
@@ -98,7 +98,7 @@ async def test_escape_3_and_alt_3_view_what_f3_views(
         await pilot.press("f3")
         await settle(pilot)
         by_f_key = list(viewer.calls)
-        assert by_f_key == [["more", f"{tree.L}/A.txt"]]
+        assert by_f_key == [[*DEFAULT_VIEWER, f"{tree.L}/A.txt"]]
 
         await pilot.press(*keys)
         await settle(pilot)

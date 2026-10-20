@@ -489,6 +489,158 @@ def test_settings_with_the_archive_fields_stay_frozen_and_hashable() -> None:
     assert len(variants) == 5
 
 
+# -- the viewer table ([viewer] command: F3's viewer) -------------------------------------------
+
+BTTY_KEYS = "home, command, exec, timeout, tmp, archive_timeout, archive_max_bytes"
+"""The [btty] keys, in the order an unknown-key error lists them."""
+
+
+def test_without_a_viewer_table_viewer_command_is_none(tmp_path: Path) -> None:
+    assert Settings().viewer_command is None
+    assert load_settings().viewer_command is None
+    assert load_settings(write(tmp_path / "c.toml", "[btty]\nexec = false\n")).viewer_command is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["bat --paging=always", "less", "less -R", "bat --style='plain header'", '"/opt/my viewer/bin/v" -x'],
+)
+def test_the_viewer_table_sets_viewer_command_as_written(tmp_path: Path, command: str) -> None:
+    """The command is kept as written; F3 splits it as a shell would."""
+    path = write(tmp_path / "c.toml", "[viewer]\ncommand = '''" + command + "'''\n")  # a TOML literal string
+    settings = load_settings(path)
+    assert settings.viewer_command == command
+    assert settings == Settings(viewer_command=command)
+
+
+def test_the_viewer_and_btty_tables_together(tmp_path: Path) -> None:
+    path = write(
+        tmp_path / "c.toml",
+        """
+        [btty]
+        exec = false
+        timeout = 30
+
+        [viewer]
+        command = "bat --paging=always"
+
+        [ui]
+        theme = "dark"
+        """,
+    )
+    assert load_settings(path) == Settings(btty_exec=False, btty_timeout=30, viewer_command="bat --paging=always")
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'command = ""',
+        'command = "   "',
+        "command = 5",
+        'command = "less \\"x"',
+        "command = 'less \"x'",
+        "command = ['less', '-R']",
+        "command = true",
+    ],
+    ids=["empty", "blank", "integer", "unclosed-double-quote", "unclosed-quote-literal", "array", "boolean"],
+)
+def test_an_invalid_viewer_command_raises_an_error_naming_the_file_and_the_key(tmp_path: Path, line: str) -> None:
+    path = write(tmp_path / "c.toml", f"[viewer]\n{line}\n")
+    with pytest.raises(ConfigError) as err:
+        load_settings(path)
+    assert err.value.path == str(path)
+    assert str(path) in str(err.value)
+    assert "[viewer] command" in err.value.reason, err.value.reason
+
+
+def test_an_unknown_key_in_the_viewer_table_raises_an_error_listing_the_known_key(tmp_path: Path) -> None:
+    path = write(tmp_path / "c.toml", '[viewer]\npager = "less"\n')
+    with pytest.raises(ConfigError) as err:
+        load_settings(path)
+    assert err.value.path == str(path)
+    assert "'pager'" in err.value.reason and "[viewer]" in err.value.reason, err.value.reason
+    assert err.value.reason.endswith("(known: command)"), err.value.reason
+
+
+@pytest.mark.parametrize("text", ["viewer = 'less'\n", "viewer = 1\n", "viewer = ['less', '-R']\n"])
+def test_viewer_that_is_not_a_table_raises_an_error_naming_the_file(tmp_path: Path, text: str) -> None:
+    path = write(tmp_path / "c.toml", text)
+    with pytest.raises(ConfigError) as err:
+        load_settings(path)
+    assert err.value.path == str(path)
+    assert str(path) in str(err.value)
+    assert "[viewer]" in err.value.reason and "table" in err.value.reason, err.value.reason
+
+
+def test_the_btty_table_errors_are_unchanged_by_the_viewer_table(tmp_path: Path) -> None:
+    """[btty] reads as before: its own not-a-table message, and an unknown key
+    lists the [btty] keys only. A [btty] ``command`` is still btty's."""
+    with pytest.raises(ConfigError) as err:
+        load_settings(write(tmp_path / "a.toml", "btty = 1\n"))
+    assert err.value.reason == "[btty] must be a table"
+    with pytest.raises(ConfigError) as err:
+        load_settings(write(tmp_path / "b.toml", "[btty]\nexecute = true\n"))
+    assert err.value.reason == f"unknown key 'execute' in [btty] (known: {BTTY_KEYS})"
+    settings = load_settings(write(tmp_path / "c.toml", '[btty]\ncommand = "/opt/bin/btty"\n'))
+    assert (settings.btty_command, settings.viewer_command) == ("/opt/bin/btty", None)
+
+
+def test_other_tables_are_still_ignored_with_a_viewer_table(tmp_path: Path) -> None:
+    path = write(tmp_path / "c.toml", "[ui]\ntheme = 'dark'\n[[plugins]]\nname = 'x'\n[viewer]\ncommand = 'most'\n")
+    assert load_settings(path) == Settings(viewer_command="most")
+
+
+def test_the_viewer_command_override_wins_over_the_file_and_none_means_not_given(tmp_path: Path) -> None:
+    path = write(tmp_path / "c.toml", '[viewer]\ncommand = "from-file"\n')
+    assert load_settings(path, overrides={"viewer_command": "bat -p"}).viewer_command == "bat -p"
+    assert load_settings(path, overrides={"viewer_command": None}).viewer_command == "from-file"
+    assert load_settings(overrides={"viewer_command": "most"}).viewer_command == "most"
+
+
+@pytest.mark.parametrize(
+    "value", ["", "   ", 5, "less 'x", ["less"]], ids=["empty", "blank", "integer", "unclosed-quote", "list"]
+)
+def test_an_invalid_viewer_command_value_raises_value_error_naming_the_field(value: object) -> None:
+    with pytest.raises(ValueError, match="viewer_command"):
+        Settings(viewer_command=value)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="viewer_command"):
+        load_settings(overrides={"viewer_command": value})
+
+
+def test_settings_with_a_viewer_command_stay_frozen_and_hashable() -> None:
+    settings = Settings(viewer_command="bat -p")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        settings.viewer_command = "less"  # type: ignore[misc]
+    assert settings == Settings(viewer_command="bat -p") and hash(settings) == hash(Settings(viewer_command="bat -p"))
+    assert len({Settings(), settings, Settings(viewer_command="bat -p"), Settings(viewer_command="less")}) == 3
+
+
+def _sample_table(doc: str, name: str) -> str:
+    """The indented ``[name]`` sample table from a docstring."""
+    lines = doc.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.strip() == f"[{name}]")
+    block = []
+    for line in lines[start:]:
+        if not line.strip():
+            break
+        block.append(line)
+    return textwrap.dedent("\n".join(block)) + "\n"
+
+
+def test_the_sample_viewer_table_in_the_module_docstring_is_a_valid_config(tmp_path: Path) -> None:
+    assert twinfm.config.__doc__ is not None
+    sample = _sample_table(twinfm.config.__doc__, "viewer")
+    settings = load_settings(write(tmp_path / "sample.toml", sample))
+    assert settings.viewer_command is not None
+    assert settings == Settings(viewer_command=settings.viewer_command)
+
+
+def test_the_config_docstrings_describe_the_viewer_table() -> None:
+    for name, doc in [("module", twinfm.config.__doc__), ("Settings", Settings.__doc__)]:
+        assert doc is not None
+        assert "[viewer]" in doc and "$PAGER" in doc and "less -R" in doc and "more" in doc, name
+
+
 # -- the documented defaults (D1, D2) ------------------------------------------------------------
 
 

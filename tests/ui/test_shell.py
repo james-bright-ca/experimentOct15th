@@ -321,9 +321,39 @@ def test_ctrl_o_ends_the_visit_unforwarded_and_the_bytes_before_it_reach_the_she
         f"the half line before Ctrl-O did not run as 'echo BEFORE': {term.since(mark)!r}"
     )
     again.toggle()
+    # Nothing the shell's terminal showed is a Ctrl-O or its echo (^O).
+    assert CTRL_O not in term.out and b"^O" not in term.out, term.out
 
 
 TOGGLES = {"ctrl": b"\x1b[111;5u", "ctrl-caps-num": b"\x1b[111;69u", "ctrl-press": b"\x1b[111;5:1u"}
+
+
+@pytest.mark.parametrize("toggle", [CTRL_O, *TOGGLES.values()], ids=["ctrl-o-byte", *TOGGLES])
+def test_ctrl_o_never_reaches_the_shell_while_the_keys_around_it_do(h: Harness, toggle: bytes) -> None:
+    """Byte for byte, with the shell reading its terminal raw (no line
+    discipline that could act on Ctrl-O): the keys typed before Ctrl-O and
+    those typed in the next visit reach the shell, the Ctrl-O (0x0F, or its
+    kitty CSI-u form) never does."""
+    start = h.dir("start")
+    term, shell = h.term(), h.shell()
+    visit = h.visit(shell, term, start)
+    assert term.wait_for(fake_shell.PROMPT)
+    visit.wait_shown()
+    run(term, "rawline", b"RAW-READY\r\n")
+
+    term.type(b"AB" + toggle)
+    assert visit.end() == ShellVisit(exited=None, cwd=start, moved=False)
+
+    again = h.visit(shell, term, start)
+    again.wait_shown()
+    mark = term.mark()
+    term.type(b"C\r")
+    assert term.wait_for(b"RAW ", mark), term.since(mark)
+    hex_at = term.since(mark).index(b"RAW ") + mark + len(b"RAW ")
+    assert term.wait_for(b"\r\n", hex_at), term.since(mark)
+    got = bytes.fromhex(term.since(hex_at).split(b"\r")[0].decode())
+    assert got == b"ABC\r", f"the shell read {got!r}"
+    again.toggle()
 
 
 @pytest.mark.parametrize("split", [False, True], ids=["one-write", "split"])

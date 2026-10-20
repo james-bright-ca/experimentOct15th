@@ -25,7 +25,7 @@ from textual.widgets import Footer
 from textual.widgets._footer import FooterKey
 
 import twinfm.ui.app as app_module
-from tests.ui.conftest import Tree
+from tests.ui.conftest import DEFAULT_VIEWER, Tree
 from tests.ui.support import (
     SIZE,
     FakeCommand,
@@ -281,7 +281,7 @@ async def test_f3_bytes_and_escape_3_bytes_view_what_f3_views(
     Terminal.app and xterm (ESC O R), the VT220 form, and Esc 3 typed fast
     (read as the Option-3 character), slowly, or as Option-3 itself."""
     by_f_key, f_names = await _viewed_by(tree, local, F3_BYTES["xterm-Terminal.app"])
-    assert by_f_key == [["more", f"{tree.L}/b.txt"]], f"ESC O R parsed as {f_names}"
+    assert by_f_key == [[*DEFAULT_VIEWER, f"{tree.L}/b.txt"]], f"ESC O R parsed as {f_names}"
     by_other, names = await _viewed_by(tree, local, *chunks)
     assert by_other == by_f_key, f"{chunks!r} parsed as {names}"
 

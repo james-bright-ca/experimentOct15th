@@ -216,7 +216,18 @@ PRESSES: dict[str, tuple[str, ...]] = {
     "escape": ("escape",),
     "escape-then-5": ("escape", "5"),
 }
-OTHER_INPUT = ["option-5", "kitty_slash_without_text", "paste", "footer-f5", "row-click", "cursor-row-click"]
+OTHER_INPUT = [
+    "option-5",
+    "kitty_slash_without_text",
+    "kitty_shift_slash_without_text",
+    "kitty_space_without_text",
+    "paste",
+    "footer-f5",
+    "footer-f3",
+    "footer-ctrl+o",
+    "row-click",
+    "cursor-row-click",
+]
 
 
 async def give(pilot: Pilot[Any], app: TwinFM, how: str) -> None:
@@ -228,10 +239,17 @@ async def give(pilot: Pilot[Any], app: TwinFM, how: str) -> None:
     elif how == "kitty_slash_without_text":
         # "/" in CSI-u form without the text field: slash with no character.
         assert await send_bytes(pilot, "\x1b[47u") == ["slash"]
+    elif how == "kitty_shift_slash_without_text":
+        # Shift+/ without the text field: shift+slash, typed as "?".
+        assert await send_bytes(pilot, "\x1b[47;2u") == ["shift+slash"]
+    elif how == "kitty_space_without_text":
+        # Space without the text field: space with no character.
+        assert await send_bytes(pilot, "\x1b[32u") == ["space"]
     elif how == "paste":
         await paste(pilot, "/some/dir")
-    elif how == "footer-f5":
-        await pilot.click(footer_key(app, "f5"))
+    elif how in ("footer-f5", "footer-f3", "footer-ctrl+o"):
+        # The footer's 5Copy, 3View and ^OShell.
+        await pilot.click(footer_key(app, how.removeprefix("footer-")))
     elif how == "row-click":
         other = "A.txt" if panel.cursor_name != "A.txt" else "c.txt"
         await click_row(pilot, panel, other)

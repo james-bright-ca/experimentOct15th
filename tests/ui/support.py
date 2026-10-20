@@ -10,7 +10,7 @@
   so no test ever opens a real btty backend.
 * ``FakeCommand`` (run_viewer / run_editor), ``FakeShellRunner`` (run_shell)
   and ``FakeShell`` (the app's shell) record what the app would hand the
-  terminal to, so no test starts more, an editor or a shell.
+  terminal to, so no test starts a viewer, an editor or a shell.
 * ``Notes`` records every notification the app shows.
 * ``settle`` / ``wait_until`` / ``move_to`` drive the Pilot.
 """
@@ -318,14 +318,17 @@ def make_app(
     run_viewer: Callable[[list[str]], int] | None = None,
     run_shell: Callable[[str, str | None], Any] | None = None,
     shell: Any = None,
+    settings: Settings | None = None,
 ) -> TwinFM:
     """TwinFM with a stub engine and a fake connector (never the registry).
     ``run_editor`` (F4), ``run_viewer`` (F3), ``run_shell`` (Ctrl-O) and
-    ``shell`` are passed on when given; left out, the app's defaults apply."""
+    ``shell`` are passed on when given; left out, the app's defaults apply.
+    ``settings`` defaults to ``Settings(btty_exec=False)``; give it to set,
+    for example, ``viewer_command`` (F3's ``[viewer] command``)."""
     return TwinFM(
         left,
         right,
-        Settings(btty_exec=False),
+        settings if settings is not None else Settings(btty_exec=False),
         engine=engine if engine is not None else StubEngine(),
         open_backend=connector if connector is not None else FakeConnector(),
         run_editor=run_editor,

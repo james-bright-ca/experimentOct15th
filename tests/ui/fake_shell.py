@@ -22,6 +22,9 @@ Run as a program (``install`` makes it an executable), it prints the prompt
                         sequence split across two writes), then ``MODES-ON``
 ``jobwinch``            a foreground job that prints ``JOB-READY``, then
                         ``JOB-WINCH`` on SIGWINCH, and ends
+``rawline``             put its terminal in raw mode, print ``RAW-READY``, read
+                        every byte up to and including a carriage return, put
+                        the terminal back and print ``RAW <the bytes in hex>``
 
 On SIGWINCH the shell itself prints ``WINCH <rows>x<columns>``. Flags such as
 ``-i`` are accepted and ignored. Standard library only.
@@ -38,7 +41,9 @@ import shlex
 import signal
 import subprocess
 import sys
+import termios
 import time
+import tty
 from pathlib import Path
 
 PROMPT = b"$ "
@@ -97,6 +102,25 @@ def _big(count: int, marker: str | None) -> None:
     _say("BIG-END")
 
 
+def _raw_line() -> None:
+    """Every byte that reaches the shell until Enter, with no line discipline
+    in between (in cooked mode the terminal itself would act on some control
+    characters, such as Ctrl-O, which is VDISCARD on macOS)."""
+    saved = termios.tcgetattr(0)
+    tty.setraw(0, termios.TCSANOW)
+    try:
+        os.write(1, b"RAW-READY\r\n")
+        got = bytearray()
+        while not got.endswith(b"\r"):
+            chunk = os.read(0, 1)
+            if not chunk:
+                break
+            got += chunk
+    finally:
+        termios.tcsetattr(0, termios.TCSANOW, saved)
+    _say(f"RAW {got.hex()}")
+
+
 def _run(words: list[str]) -> None:
     command, args = words[0], words[1:]
     if command == "echo":
@@ -131,6 +155,8 @@ def _run(words: list[str]) -> None:
         _say("MODES-ON")
     elif command == "jobwinch":
         _foreground_job([sys.executable, "-I", "-S", "-c", _JOB_WINCH])
+    elif command == "rawline":
+        _raw_line()
     else:
         _say(f"unknown: {command}")
 

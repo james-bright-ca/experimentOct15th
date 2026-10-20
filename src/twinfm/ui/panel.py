@@ -193,9 +193,6 @@ class Panel(Vertical):
         yield self._find
 
     def on_mount(self) -> None:
-        self._table.add_column("Name", key="name")
-        self._table.add_column("Size", key="size", width=8)
-        self._table.add_column("Modified", key="mtime", width=16)
         self._render_listing(None)
         self.load(self.path)
 
@@ -409,9 +406,9 @@ class Panel(Vertical):
         listable = self.listable
         self._table.display = listable
         self._message.display = not listable
+        self._clear_table()
         if listable:
             self._rows = ([PARENT] if self.path != "/" else []) + [e.name for e in self.entries]
-            self._table.clear()
             if self.path != "/":
                 self._table.add_row(Text(PARENT), Text("<UP>", justify="right"), Text(""), key=PARENT)
             for entry in self.entries:
@@ -420,7 +417,6 @@ class Panel(Vertical):
             self._table.move_cursor(row=index, animate=False)
         else:
             self._rows = []
-            self._table.clear()
             self._message.update(
                 f"Transfer-only: {self.backend.label} cannot list directories.\n\n"
                 "F5 here downloads a file by its path into the other panel.\n"
@@ -430,6 +426,15 @@ class Panel(Vertical):
         if had_focus:
             self.focus_view()
         self._render_status()
+
+    def _clear_table(self) -> None:
+        """Empty the listing, its columns too: DataTable only ever widens an
+        auto-width column, so the Name column is measured afresh from the
+        rows added next."""
+        self._table.clear(columns=True)
+        self._table.add_column("Name", key="name")
+        self._table.add_column("Size", key="size", width=8)
+        self._table.add_column("Modified", key="mtime", width=16)
 
     def _cells(self, entry: Entry) -> tuple[Text, Text, Text]:
         style = ""
